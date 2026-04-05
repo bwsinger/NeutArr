@@ -4,18 +4,88 @@ Quality Upgrade Processing for Radarr
 Handles searching for movies that need quality upgrades in Radarr
 """
 
-import time
 import random
-from typing import List, Dict, Any, Set, Callable
+from typing import Dict, Any, Callable, Optional, Tuple
 from src.primary.utils.logger import get_logger
 from src.primary.apps.radarr import api as radarr_api
 from src.primary.stats_manager import increment_stat
 from src.primary.stateful_manager import is_processed, add_processed_id
 from src.primary.utils.history_utils import log_processed_media
-from src.primary.settings_manager import get_advanced_setting
 
 # Get logger for the app
 radarr_logger = get_logger("radarr")
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_release_preference(
+    release_like: Dict[str, Any], profile_info: Dict[str, Any]
+) -> Optional[Tuple[int, int]]:
+    quality_id = release_like.get("quality", {}).get("quality", {}).get("id")
+    quality_rank = profile_info.get("quality_rank", {}).get(quality_id)
+
+    if quality_rank is None:
+        return None
+
+    return quality_rank, _coerce_int(release_like.get("customFormatScore"), 0)
+
+
+def _select_strict_upgrade_candidate(
+    movie: Dict[str, Any], releases: list[Dict[str, Any]], profile_info: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    movie_file = movie.get("movieFile") or {}
+    current_preference = _get_release_preference(movie_file, profile_info)
+    if current_preference is None:
+        return None
+
+    current_quality_rank, current_custom_format_score = current_preference
+    cutoff_format_score = _coerce_int(profile_info.get("cutoff_format_score"), 0)
+    min_upgrade_format_score = max(1, _coerce_int(profile_info.get("min_upgrade_format_score"), 1))
+
+    best_candidate = None
+    best_preference = None
+
+    for release in releases:
+        if not release.get("approved"):
+            continue
+
+        if release.get("rejected"):
+            continue
+
+        if not release.get("downloadAllowed"):
+            continue
+
+        candidate_preference = _get_release_preference(release, profile_info)
+        if candidate_preference is None:
+            continue
+
+        candidate_quality_rank, candidate_custom_format_score = candidate_preference
+
+        if candidate_quality_rank > current_quality_rank:
+            is_valid_upgrade = True
+        elif candidate_quality_rank == current_quality_rank:
+            is_valid_upgrade = (
+                current_custom_format_score < cutoff_format_score
+                and candidate_custom_format_score >= current_custom_format_score + min_upgrade_format_score
+            )
+        else:
+            is_valid_upgrade = False
+
+        if not is_valid_upgrade:
+            continue
+
+        if best_preference is None or candidate_preference > best_preference:
+            best_candidate = release
+            best_preference = candidate_preference
+
+    return best_candidate
 
 
 def process_cutoff_upgrades(
@@ -38,14 +108,9 @@ def process_cutoff_upgrades(
     # Extract necessary settings
     api_url = app_settings.get("api_url", "").strip()
     api_key = app_settings.get("api_key", "").strip()
-    api_timeout = get_advanced_setting("api_timeout", 120)  # Use general.json value
+    api_timeout = app_settings.get("api_timeout", 120)
     monitored_only = app_settings.get("monitored_only", True)
-    # skip_movie_refresh setting removed as it was a performance bottleneck
     hunt_upgrade_movies = app_settings.get("hunt_upgrade_movies", 0)
-
-    # Use advanced settings from general.json for command operations
-    command_wait_delay = get_advanced_setting("command_wait_delay", 1)
-    command_wait_attempts = get_advanced_setting("command_wait_attempts", 600)
 
     # Get instance name - check for instance_name first, fall back to legacy "name" key if needed
     instance_name = app_settings.get("instance_name", app_settings.get("name", "Radarr Default"))
@@ -56,6 +121,11 @@ def process_cutoff_upgrades(
 
     if not upgrade_eligible_data:
         radarr_logger.info("No movies found eligible for upgrade or error retrieving them.")
+        return False
+
+    profile_map = radarr_api.get_quality_profile_map(api_url, api_key, api_timeout)
+    if profile_map is None:
+        radarr_logger.info("Unable to build Radarr quality profile map. Skipping upgrades.")
         return False
 
     radarr_logger.info(f"Found {len(upgrade_eligible_data)} movies eligible for upgrade.")
@@ -77,14 +147,17 @@ def process_cutoff_upgrades(
         radarr_logger.info("No upgradeable movies found to process (after filtering already processed). Skipping.")
         return False
 
-    radarr_logger.info(f"Randomly selecting up to {hunt_upgrade_movies} movies for upgrade search.")
-    movies_to_process = random.sample(unprocessed_movies, min(hunt_upgrade_movies, len(unprocessed_movies)))  # nosec B311
+    radarr_logger.info("Randomizing upgrade candidate order before strict release preflight.")
+    movies_to_process = unprocessed_movies[:]
+    random.shuffle(movies_to_process)
 
-    radarr_logger.info(f"Selected {len(movies_to_process)} movies to search for upgrades.")
     processed_count = 0
     processed_something = False
 
     for movie in movies_to_process:
+        if processed_count >= hunt_upgrade_movies:
+            break
+
         if stop_check():
             radarr_logger.info("Stop signal received, aborting Radarr upgrade cycle.")
             break
@@ -92,17 +165,35 @@ def process_cutoff_upgrades(
         movie_id = movie.get("id")
         movie_title = movie.get("title")
         movie_year = movie.get("year")
+        profile_id = movie.get("qualityProfileId")
+        profile_info = profile_map.get(profile_id)
 
         radarr_logger.info(f'Processing upgrade for movie: "{movie_title}" ({movie_year}) (Movie ID: {movie_id})')
 
-        # Refresh functionality has been removed as it was identified as a performance bottleneck
+        if profile_info is None:
+            radarr_logger.warning(f"  - Skipping movie because quality profile {profile_id} could not be resolved.")
+            continue
 
-        # Search for cutoff upgrade
-        radarr_logger.info(f"  - Searching for quality upgrade...")
-        search_result = radarr_api.movie_search(api_url, api_key, api_timeout, [movie_id])
+        releases = radarr_api.get_release_preflight(api_url, api_key, api_timeout, movie_id)
+        if releases is None:
+            radarr_logger.warning("  - Failed to retrieve release preflight data.")
+            continue
 
-        if search_result:
-            radarr_logger.info(f"  - Successfully triggered search for quality upgrade.")
+        best_release = _select_strict_upgrade_candidate(movie, releases, profile_info)
+        if best_release is None:
+            radarr_logger.info("  - No strictly better downloadable release found in preflight results.")
+            continue
+
+        release_title = best_release.get("title", "Unknown Release")
+        release_quality = best_release.get("quality", {}).get("quality", {}).get("name", "Unknown Quality")
+        release_custom_format_score = _coerce_int(best_release.get("customFormatScore"), 0)
+        radarr_logger.info(
+            f"  - Selected release: {release_title} [{release_quality}] (custom format score: {release_custom_format_score})"
+        )
+
+        download_result = radarr_api.download_release(api_url, api_key, api_timeout, best_release)
+        if download_result:
+            radarr_logger.info("  - Successfully queued explicit release download.")
             add_processed_id("radarr", instance_name, str(movie_id))
             increment_stat("radarr", "upgraded")
 
@@ -114,7 +205,7 @@ def process_cutoff_upgrades(
             processed_count += 1
             processed_something = True
         else:
-            radarr_logger.warning(f"  - Failed to trigger search for quality upgrade.")
+            radarr_logger.warning("  - Failed to queue explicit release download.")
 
     # Log final status
     radarr_logger.info(f"Completed processing {processed_count} movies for quality upgrades.")

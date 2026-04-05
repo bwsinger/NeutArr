@@ -22,6 +22,63 @@ radarr_logger = get_logger("radarr")
 session = requests.Session()
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_quality_profile_map(profiles: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    profile_map = {}
+
+    for profile in profiles:
+        rank = 0
+        quality_rank = {}
+
+        for item in profile.get("items", []):
+            item_id = item.get("id")
+
+            if item.get("quality"):
+                quality_id = item["quality"].get("id")
+                if quality_id is not None:
+                    quality_rank[quality_id] = rank
+
+                if item_id is not None:
+                    quality_rank[item_id] = rank
+
+                rank += 1
+            elif item.get("items"):
+                if item_id is not None:
+                    quality_rank[item_id] = rank
+
+                for sub_item in item["items"]:
+                    if sub_item.get("quality"):
+                        quality_id = sub_item["quality"].get("id")
+                        if quality_id is not None:
+                            quality_rank[quality_id] = rank
+
+                rank += 1
+
+        profile_id = profile.get("id")
+        if profile_id is None:
+            continue
+
+        profile_map[profile_id] = {
+            "id": profile_id,
+            "name": profile.get("name", f"Profile {profile_id}"),
+            "upgrade_allowed": profile.get("upgradeAllowed", True),
+            "cutoff_id": profile.get("cutoff"),
+            "cutoff_format_score": _coerce_int(profile.get("cutoffFormatScore"), 0),
+            "min_upgrade_format_score": max(1, _coerce_int(profile.get("minUpgradeFormatScore"), 1)),
+            "quality_rank": quality_rank,
+        }
+
+    return profile_map
+
+
 def arr_request(
     api_url: str, api_key: str, api_timeout: int, endpoint: str, method: str = "GET", data: Dict = None
 ) -> Any:
@@ -152,6 +209,16 @@ def get_movies_with_missing(api_url: str, api_key: str, api_timeout: int, monito
     return missing_movies
 
 
+def get_quality_profile_map(api_url: str, api_key: str, api_timeout: int) -> Optional[Dict[int, Dict[str, Any]]]:
+    """Get Radarr quality profiles keyed by profile ID with derived quality ranks."""
+    profiles = arr_request(api_url, api_key, api_timeout, "qualityprofile")
+    if profiles is None:
+        radarr_logger.error("Failed to retrieve quality profiles from Radarr API.")
+        return None
+
+    return _build_quality_profile_map(profiles)
+
+
 def get_cutoff_unmet_movies(api_url: str, api_key: str, api_timeout: int, monitored_only: bool) -> Optional[List[Dict]]:
     """
     Get a list of movies that don't meet their quality profile cutoff.
@@ -175,38 +242,9 @@ def get_cutoff_unmet_movies(api_url: str, api_key: str, api_timeout: int, monito
         radarr_logger.error("Failed to retrieve movies from Radarr API for cutoff check.")
         return None
 
-    # Need quality profile information to determine cutoff unmet status.
-    # Fetch quality profiles first.
-    profiles = arr_request(api_url, api_key, api_timeout, "qualityprofile")
-    if profiles is None:
-        radarr_logger.error("Failed to retrieve quality profiles from Radarr API.")
+    profile_map = get_quality_profile_map(api_url, api_key, api_timeout)
+    if profile_map is None:
         return None
-
-    # Build a map of profile_id -> {cutoff_id, quality_rank} where quality_rank maps
-    # each quality ID to its position in the profile's ordered items list.
-    # Radarr quality profile 'items' are ordered from lowest to highest quality,
-    # and 'cutoff' is the quality ID of the minimum acceptable quality.
-    profile_map = {}
-    for p in profiles:
-        # Build a rank map from the profile's items list
-        # Items can be individual qualities or groups containing sub-qualities
-        rank = 0
-        quality_rank = {}
-        for item in p.get("items", []):
-            if item.get("quality"):
-                # Individual quality entry
-                quality_rank[item["quality"]["id"]] = rank
-                rank += 1
-            elif item.get("items"):
-                # Quality group - all sub-qualities share the same rank
-                for sub_item in item["items"]:
-                    if sub_item.get("quality"):
-                        quality_rank[sub_item["quality"]["id"]] = rank
-                rank += 1
-        profile_map[p["id"]] = {
-            "cutoff_id": p.get("cutoff"),
-            "quality_rank": quality_rank,
-        }
 
     unmet_movies = []
     for movie in movies:
@@ -219,15 +257,22 @@ def get_cutoff_unmet_movies(api_url: str, api_key: str, api_timeout: int, monito
         if not monitored_only or is_monitored:
             if has_file and movie_file and profile_id in profile_map:
                 profile_info = profile_map[profile_id]
+                if not profile_info.get("upgrade_allowed", True):
+                    continue
+
                 cutoff_id = profile_info["cutoff_id"]
                 quality_rank = profile_info["quality_rank"]
                 current_quality_id = movie_file.get("quality", {}).get("quality", {}).get("id")
+                current_custom_format_score = _coerce_int(movie_file.get("customFormatScore"), 0)
+                cutoff_format_score = _coerce_int(profile_info.get("cutoff_format_score"), 0)
 
                 # Compare by rank position in the profile, not by raw quality ID
                 current_rank = quality_rank.get(current_quality_id)
                 cutoff_rank = quality_rank.get(cutoff_id)
+                quality_cutoff_not_met = current_rank is not None and cutoff_rank is not None and current_rank < cutoff_rank
+                custom_format_cutoff_not_met = current_custom_format_score < cutoff_format_score
 
-                if current_rank is not None and cutoff_rank is not None and current_rank < cutoff_rank:
+                if quality_cutoff_not_met or custom_format_cutoff_not_met:
                     unmet_movies.append(movie)
 
     radarr_logger.debug(f"Found {len(unmet_movies)} cutoff unmet movies (monitored_only={monitored_only}).")
@@ -291,6 +336,34 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
     else:
         radarr_logger.error(f"Failed to trigger search command for movie IDs {movie_ids}. Response: {response}")
         return None
+
+
+def get_release_preflight(api_url: str, api_key: str, api_timeout: int, movie_id: int) -> Optional[List[Dict[str, Any]]]:
+    """Get preflighted release candidates for a movie."""
+    response = arr_request(api_url, api_key, api_timeout, f"release?movieId={movie_id}")
+    if response is None:
+        radarr_logger.error(f"Failed to retrieve release preflight data for movie ID {movie_id}.")
+        return None
+
+    return response
+
+
+def download_release(api_url: str, api_key: str, api_timeout: int, release: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Download a specific release returned by the release preflight endpoint."""
+    if not release.get("guid"):
+        radarr_logger.error("Cannot download release without a guid.")
+        return None
+
+    if release.get("indexerId") is None:
+        radarr_logger.error(f"Cannot download release {release.get('guid')} without an indexerId.")
+        return None
+
+    response = arr_request(api_url, api_key, api_timeout, "release", method="POST", data=release)
+    if response is None:
+        radarr_logger.error(f"Failed to download release {release.get('guid')}.")
+        return None
+
+    return response
 
 
 def check_connection(api_url: str, api_key: str, api_timeout: int) -> bool:
