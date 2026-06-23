@@ -63,6 +63,46 @@
   <p>A focused fork lineage of Huntarr v6.6.3, rebuilt around tighter scope, stronger auth, and cleaner operations.</p>
 </div>
 
+## This Fork: Upgrade Decision Fixes
+
+This fork carries a small set of personal changes focused on making upgrade searches stricter, quieter, and easier to audit.
+
+### Radarr: Explicit Release Preflight
+
+- **Issue:** Radarr upgrades could trigger without first proving that a better release was available.
+- **Change:** NeutArr now preflights available Radarr releases, compares each candidate against the current file using quality profile order, and queues the best explicit release.
+- **Result:** Broad `MoviesSearch` calls are avoided for upgrades unless Radarr exposes a strictly better downloadable candidate.
+
+### Radarr: Consistent Profile-Based Ranking
+
+- **Issue:** Upgrade eligibility and release selection could interpret Radarr quality profile data differently.
+- **Change:** Radarr profile metadata is normalized into a reusable quality map with quality rank, cutoff quality, custom format cutoff, minimum upgrade score, and `upgradeAllowed`.
+- **Result:** Candidate detection and download decisions now use the same ranking and cutoff rules.
+
+### Sonarr: Safer Season-Pack Upgrades
+
+- **Issue:** One or two cutoff-unmet episodes could trigger a full season-pack upgrade search.
+- **Change:** Season-pack mode now requires both a minimum cutoff-unmet episode count and a minimum cutoff-unmet percentage before searching a season.
+- **Result:** Full season searches are reserved for seasons with enough upgrade value to justify the broader search.
+
+### Sonarr: Full-Season Context
+
+- **Issue:** Season-pack choices were based too heavily on the initial random cutoff-unmet sample.
+- **Change:** NeutArr now fetches full aired series episode data and full cutoff-unmet series data before calculating season eligibility.
+- **Result:** Threshold checks reflect the actual state of each aired season instead of overreacting to a small sample.
+
+### Sonarr: Configurable Thresholds
+
+- **Issue:** Season-pack aggressiveness could not be tuned from settings.
+- **Change:** The Sonarr settings UI and default config now expose season-pack minimum episode and percentage thresholds.
+- **Result:** Users can tune season-pack behavior directly, with the controls shown only when `Upgrade Mode` is set to `Season Packs`.
+
+### Upgrade Diagnostics
+
+- **Issue:** Upgrade decisions were hard to reconstruct from ordinary logs.
+- **Change:** Radarr and Sonarr upgrade paths now emit bounded structured `AI_EVENT` debug logs for samples, skipped candidates, selected releases or seasons, threshold failures, and completion events.
+- **Result:** It is easier to see why NeutArr did or did not trigger an upgrade without reading scattered free-form log lines.
+
 NeutArr traces its code lineage from [Huntarr](https://github.com/plexguide/Huntarr.io) v6.6.3 — the last clean release before the project was abandoned under [controversial circumstances](https://www.reddit.com/r/selfhosted/comments/1rckopd/huntarr_your_passwords_and_your_entire_arr_stacks/) — through ElfHosted's [NewtArr](https://github.com/elfhosted/newtarr) v1.0.0, which served as the starting point for this project.
 
 NeutArr keeps the core functionality (hunt missing media, trigger quality upgrades) while rebuilding the auth system, hardening security, and stripping everything that grew beyond the original scope.

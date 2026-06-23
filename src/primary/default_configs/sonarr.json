@@ -10,6 +10,8 @@
   "hunt_missing_items": 1,
   "hunt_upgrade_items": 0,
   "upgrade_mode": "episodes",
+  "season_upgrade_min_cutoff_unmet_episodes": 3,
+  "season_upgrade_min_cutoff_unmet_percent": 40,
   "hunt_missing_mode": "episodes",
   "sleep_duration": 900,
   "monitored_only": true,

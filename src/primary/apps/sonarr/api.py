@@ -924,6 +924,36 @@ def get_series_by_id(api_url: str, api_key: str, api_timeout: int, series_id: in
         return None
 
 
+def get_episodes_for_series(
+    api_url: str, api_key: str, api_timeout: int, series_id: int, monitored_only: bool = True
+) -> List[Dict[str, Any]]:
+    """Get all episodes for a specific series."""
+    try:
+        endpoint = f"{api_url}/api/v3/episode?seriesId={series_id}"
+        response = requests.get(endpoint, headers={"X-Api-Key": api_key}, timeout=api_timeout)
+        response.raise_for_status()
+
+        if not response.content:
+            return []
+
+        episodes = response.json()
+        if monitored_only:
+            episodes = [episode for episode in episodes if episode.get("monitored", False)]
+
+        sonarr_logger.debug(
+            f"Fetched {len(episodes)} episodes for series ID {series_id} (monitored_only={monitored_only})"
+        )
+        return episodes
+    except requests.exceptions.RequestException as e:
+        sonarr_logger.error(f"Error getting Sonarr episodes for series ID {series_id}: {e}")
+        return []
+    except Exception as e:
+        sonarr_logger.error(
+            f"An unexpected error occurred while getting Sonarr episodes for series ID {series_id}: {e}"
+        )
+        return []
+
+
 def search_season(
     api_url: str, api_key: str, api_timeout: int, series_id: int, season_number: int
 ) -> Optional[Union[int, str]]:

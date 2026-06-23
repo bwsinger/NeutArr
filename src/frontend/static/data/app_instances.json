@@ -10,13 +10,7 @@
   "sonarr": [
     {
       "id": "0",
-      "name": "Default",
-      "display_name": "Sonarr",
-      "order": 1
-    },
-    {
-      "id": "1",
-      "name": "Instance 2",
+      "name": "Sonarr",
       "display_name": "Sonarr",
       "order": 1
     }
@@ -24,7 +18,7 @@
   "radarr": [
     {
       "id": "0",
-      "name": "Default",
+      "name": "Radarr",
       "display_name": "Radarr",
       "order": 2
     }
@@ -32,7 +26,7 @@
   "readarr": [
     {
       "id": "0",
-      "name": "Default",
+      "name": "Bookshelf",
       "display_name": "Readarr",
       "order": 3
     }

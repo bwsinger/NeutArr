@@ -78,6 +78,7 @@ const SettingsForms = {
         `;
 
         // Search Settings
+        const showSeasonUpgradeThresholds = settings.upgrade_mode === 'seasons_packs';
         let searchSettingsHtml = `
             <div class="settings-group">
                 <h3>Search Settings</h3>
@@ -97,6 +98,16 @@ const SettingsForms = {
                         <option value="seasons_packs" ${settings.upgrade_mode === 'seasons_packs' ? 'selected' : ''}>Season Packs</option>
                     </select>
                     <p class="setting-help">How to search for Sonarr upgrades (Seasons/Shows modes upgrade entire seasons or shows at once)</p>
+                </div>
+                <div class="setting-item sonarr-season-upgrade-threshold-setting" style="${showSeasonUpgradeThresholds ? '' : 'display: none;'}">
+                    <label for="sonarr-season-upgrade-min-cutoff-unmet-episodes"><span class="info-icon" title="Minimum cutoff-unmet episodes required before a season-pack upgrade is eligible"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Season Upgrade Min Episodes:</label>
+                    <input type="number" id="sonarr-season-upgrade-min-cutoff-unmet-episodes" name="season_upgrade_min_cutoff_unmet_episodes" min="1" value="${settings.season_upgrade_min_cutoff_unmet_episodes !== undefined ? settings.season_upgrade_min_cutoff_unmet_episodes : 3}">
+                    <p class="setting-help">Minimum cutoff-unmet episodes required before a season-pack upgrade search is allowed</p>
+                </div>
+                <div class="setting-item sonarr-season-upgrade-threshold-setting" style="${showSeasonUpgradeThresholds ? '' : 'display: none;'}">
+                    <label for="sonarr-season-upgrade-min-cutoff-unmet-percent"><span class="info-icon" title="Minimum percentage of a season that must be cutoff-unmet before a season-pack upgrade is eligible"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Season Upgrade Min Percent:</label>
+                    <input type="number" id="sonarr-season-upgrade-min-cutoff-unmet-percent" name="season_upgrade_min_cutoff_unmet_percent" min="0" max="100" value="${settings.season_upgrade_min_cutoff_unmet_percent !== undefined ? settings.season_upgrade_min_cutoff_unmet_percent : 40}">
+                    <p class="setting-help">Minimum percentage of season episodes that must be cutoff-unmet before a season-pack upgrade search is allowed</p>
                 </div>
                 <div class="setting-item">
                     <label for="sonarr-hunt-missing-items"><span class="info-icon" title="Number of missing items to search per cycle (0 = disabled)"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Missing Search:</label>
@@ -147,6 +158,19 @@ const SettingsForms = {
 
         // Setup instance management (add/remove/test)
         SettingsForms.setupInstanceManagement(container, 'sonarr', settings.instances.length);
+
+        const upgradeModeSelect = container.querySelector('#sonarr-upgrade-mode');
+        const seasonThresholdSettings = container.querySelectorAll('.sonarr-season-upgrade-threshold-setting');
+        const syncSonarrSeasonUpgradeThresholdVisibility = () => {
+            const shouldShow = upgradeModeSelect && upgradeModeSelect.value === 'seasons_packs';
+            seasonThresholdSettings.forEach((element) => {
+                element.style.display = shouldShow ? '' : 'none';
+            });
+        };
+        if (upgradeModeSelect) {
+            upgradeModeSelect.addEventListener('change', syncSonarrSeasonUpgradeThresholdVisibility);
+            syncSonarrSeasonUpgradeThresholdVisibility();
+        }
     },
     
     // Generate Radarr settings form
@@ -1225,6 +1249,12 @@ const SettingsForms = {
             if (appType === 'sonarr') {
                 settings.hunt_missing_mode = getInputValue('#sonarr-hunt-missing-mode', 'episodes');
                 settings.upgrade_mode = getInputValue('#sonarr-upgrade-mode', 'episodes');
+                settings.season_upgrade_min_cutoff_unmet_episodes = getInputValue(
+                    '#sonarr-season-upgrade-min-cutoff-unmet-episodes', 3
+                );
+                settings.season_upgrade_min_cutoff_unmet_percent = getInputValue(
+                    '#sonarr-season-upgrade-min-cutoff-unmet-percent', 40
+                );
                 settings.hunt_missing_items = getInputValue('#sonarr-hunt-missing-items', 1);
                 settings.hunt_upgrade_items = getInputValue('#sonarr-hunt-upgrade-items', 0);
                 settings.sleep_duration = getInputValue('#sonarr_sleep_duration', 900);

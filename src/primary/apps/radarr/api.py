@@ -424,13 +424,16 @@ def movie_search(api_url: str, api_key: str, api_timeout: int, movie_ids: List[i
         return None
 
 
-def get_release_preflight(api_url: str, api_key: str, api_timeout: int, movie_id: int) -> Optional[List[Dict[str, Any]]]:
+def get_release_preflight(
+    api_url: str, api_key: str, api_timeout: int, movie_id: int
+) -> Optional[List[Dict[str, Any]]]:
     """Get preflighted release candidates for a movie."""
     response = arr_request(api_url, api_key, api_timeout, f"release?movieId={movie_id}")
     if response is None:
         radarr_logger.error(f"Failed to retrieve release preflight data for movie ID {movie_id}.")
         return None
 
+    radarr_logger.debug(f"Retrieved {len(response)} release preflight candidates for movie ID {movie_id}.")
     return response
 
 
@@ -444,6 +447,11 @@ def download_release(api_url: str, api_key: str, api_timeout: int, release: Dict
         radarr_logger.error(f"Cannot download release {release.get('guid')} without an indexerId.")
         return None
 
+    radarr_logger.debug(
+        "Submitting explicit Radarr release download for "
+        f"title={release.get('title', 'Unknown Release')}, guid={release.get('guid')}, "
+        f"indexerId={release.get('indexerId')}, customFormatScore={_coerce_int(release.get('customFormatScore'), 0)}"
+    )
     response = arr_request(api_url, api_key, api_timeout, "release", method="POST", data=release)
     if response is None:
         radarr_logger.error(f"Failed to download release {release.get('guid')}.")

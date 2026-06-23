@@ -370,6 +370,12 @@ def app_specific_loop(app_type: str) -> None:
                         monitored_only = combined_settings.get("monitored_only", True)
                         hunt_upgrade_items = combined_settings.get("hunt_upgrade_items", 0)
                         upgrade_mode = combined_settings.get("upgrade_mode", "episodes")
+                        season_upgrade_min_cutoff_unmet_episodes = combined_settings.get(
+                            "season_upgrade_min_cutoff_unmet_episodes", 3
+                        )
+                        season_upgrade_min_cutoff_unmet_percent = combined_settings.get(
+                            "season_upgrade_min_cutoff_unmet_percent", 40
+                        )
                         command_wait_delay = combined_settings.get("command_wait_delay", 1)
                         command_wait_attempts = combined_settings.get("command_wait_attempts", 600)
 
@@ -381,6 +387,8 @@ def app_specific_loop(app_type: str) -> None:
                             monitored_only=monitored_only,
                             hunt_upgrade_items=hunt_upgrade_items,
                             upgrade_mode=upgrade_mode,
+                            season_upgrade_min_cutoff_unmet_episodes=season_upgrade_min_cutoff_unmet_episodes,
+                            season_upgrade_min_cutoff_unmet_percent=season_upgrade_min_cutoff_unmet_percent,
                             command_wait_delay=command_wait_delay,
                             command_wait_attempts=command_wait_attempts,
                             stop_check=stop_check_func,
