@@ -5,6 +5,7 @@ Sonarr cutoff upgrade processing module for NeutArr
 
 import time
 import random
+import json
 from typing import List, Dict, Any, Callable, Union
 from src.primary.utils.logger import get_logger
 from src.primary.apps.sonarr import api as sonarr_api
@@ -15,6 +16,30 @@ from src.primary.settings_manager import get_advanced_setting
 
 # Get logger for the Sonarr app
 sonarr_logger = get_logger("sonarr")
+DECISION_SAMPLE_LIMIT = 3
+
+
+def _log_decision_event(event: str, **payload: Any) -> None:
+    message = json.dumps({"event": event, **payload}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    sonarr_logger.debug(f"DECISION_EVENT {message}")
+
+
+def _season_decision_snapshot(
+    series_id: int,
+    season_number: int,
+    cutoff_unmet_count: int,
+    total_episodes: int,
+    cutoff_unmet_percent: float,
+    series_title: str,
+) -> Dict[str, Any]:
+    return {
+        "series_id": series_id,
+        "series_title": series_title,
+        "season_number": season_number,
+        "cutoff_unmet_count": cutoff_unmet_count,
+        "total_episodes": total_episodes,
+        "cutoff_unmet_percent": round(cutoff_unmet_percent, 1),
+    }
 
 
 def _filter_aired_episodes(episodes: List[Dict[str, Any]], context: str) -> List[Dict[str, Any]]:
@@ -349,6 +374,9 @@ def process_upgrade_seasons_mode(
 
     available_seasons = []
     season_cutoff_unmet_episode_map: Dict[tuple[int, int], List[Dict[str, Any]]] = {}
+    skipped_counts = {"min_cutoff_unmet_episodes": 0, "min_cutoff_unmet_percent": 0}
+    skipped_examples = {"min_cutoff_unmet_episodes": [], "min_cutoff_unmet_percent": []}
+    considered_season_count = 0
 
     for series_id in candidate_series_ids:
         all_series_cutoff_unmet = sonarr_api.get_cutoff_unmet_episodes_for_series(
@@ -409,13 +437,38 @@ def process_upgrade_seasons_mode(
             if total_episodes <= 0 or cutoff_unmet_count <= 0:
                 continue
 
+            considered_season_count += 1
             cutoff_unmet_percent = (cutoff_unmet_count / total_episodes) * 100
             series_title = season_data["series_title"]
 
             if cutoff_unmet_count < season_upgrade_min_cutoff_unmet_episodes:
+                skipped_counts["min_cutoff_unmet_episodes"] += 1
+                if len(skipped_examples["min_cutoff_unmet_episodes"]) < DECISION_SAMPLE_LIMIT:
+                    skipped_examples["min_cutoff_unmet_episodes"].append(
+                        _season_decision_snapshot(
+                            series_id,
+                            season_number,
+                            cutoff_unmet_count,
+                            total_episodes,
+                            cutoff_unmet_percent,
+                            series_title,
+                        )
+                    )
                 continue
 
             if cutoff_unmet_percent < season_upgrade_min_cutoff_unmet_percent:
+                skipped_counts["min_cutoff_unmet_percent"] += 1
+                if len(skipped_examples["min_cutoff_unmet_percent"]) < DECISION_SAMPLE_LIMIT:
+                    skipped_examples["min_cutoff_unmet_percent"].append(
+                        _season_decision_snapshot(
+                            series_id,
+                            season_number,
+                            cutoff_unmet_count,
+                            total_episodes,
+                            cutoff_unmet_percent,
+                            series_title,
+                        )
+                    )
                 continue
 
             season_cutoff_unmet_episode_map[(series_id, season_number)] = cutoff_unmet_for_season
@@ -424,6 +477,20 @@ def process_upgrade_seasons_mode(
             )
 
     if not available_seasons:
+        _log_decision_event(
+            "sonarr_season_pack_candidates",
+            result="no_candidates",
+            candidate_series_count=len(candidate_series_ids),
+            considered_season_count=considered_season_count,
+            thresholds={
+                "min_cutoff_unmet_episodes": season_upgrade_min_cutoff_unmet_episodes,
+                "min_cutoff_unmet_percent": season_upgrade_min_cutoff_unmet_percent,
+            },
+            skipped_counts=skipped_counts,
+            skipped_examples=skipped_examples,
+            eligible_count=0,
+            selected_seasons=[],
+        )
         sonarr_logger.info("No valid seasons with cutoff unmet episodes met the configured thresholds.")
         return False
 
@@ -432,6 +499,30 @@ def process_upgrade_seasons_mode(
     seasons_to_process = available_seasons[:hunt_upgrade_items]
 
     sonarr_logger.info(f"Selected {len(seasons_to_process)} seasons with cutoff unmet episodes to process")
+    _log_decision_event(
+        "sonarr_season_pack_candidates",
+        result="selected",
+        candidate_series_count=len(candidate_series_ids),
+        considered_season_count=considered_season_count,
+        thresholds={
+            "min_cutoff_unmet_episodes": season_upgrade_min_cutoff_unmet_episodes,
+            "min_cutoff_unmet_percent": season_upgrade_min_cutoff_unmet_percent,
+        },
+        skipped_counts=skipped_counts,
+        skipped_examples=skipped_examples,
+        eligible_count=len(available_seasons),
+        selected_seasons=[
+            _season_decision_snapshot(
+                series_id,
+                season_number,
+                episode_count,
+                total_episodes,
+                cutoff_unmet_percent,
+                series_title,
+            )
+            for series_id, season_number, episode_count, total_episodes, cutoff_unmet_percent, series_title in seasons_to_process
+        ],
+    )
 
     # Process each selected season
     for series_id, season_number, _, _, _, series_title in seasons_to_process:

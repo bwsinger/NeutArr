@@ -5,6 +5,7 @@ Handles searching for movies that need quality upgrades in Radarr
 """
 
 import random
+import json
 from typing import Dict, Any, Callable, Optional, Tuple
 from src.primary.utils.logger import get_logger
 from src.primary.apps.radarr import api as radarr_api
@@ -14,6 +15,11 @@ from src.primary.utils.history_utils import log_processed_media
 
 # Get logger for the app
 radarr_logger = get_logger("radarr")
+
+
+def _log_decision_event(event: str, **payload: Any) -> None:
+    message = json.dumps({"event": event, **payload}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    radarr_logger.debug(f"DECISION_EVENT {message}")
 
 
 def _coerce_int(value: Any, default: int = 0) -> int:
@@ -35,6 +41,21 @@ def _get_release_preference(release_like: Dict[str, Any], profile_info: Dict[str
     return quality_rank, _coerce_int(release_like.get("customFormatScore"), 0)
 
 
+def _release_decision_snapshot(release_like: Optional[Dict[str, Any]], profile_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if release_like is None:
+        return None
+
+    quality = release_like.get("quality", {}).get("quality", {}) or {}
+    preference = _get_release_preference(release_like, profile_info)
+    return {
+        "title": release_like.get("title") or release_like.get("relativePath") or "Unknown Release",
+        "quality_name": quality.get("name", "Unknown Quality"),
+        "quality_id": quality.get("id"),
+        "quality_rank": preference[0] if preference is not None else None,
+        "custom_format_score": _coerce_int(release_like.get("customFormatScore"), 0),
+    }
+
+
 def _select_strict_upgrade_candidate(
     movie: Dict[str, Any], releases: list[Dict[str, Any]], profile_info: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
@@ -43,6 +64,14 @@ def _select_strict_upgrade_candidate(
     current_preference = _get_release_preference(movie_file, profile_info)
     if current_preference is None:
         radarr_logger.debug(f"Skipping movie ID {movie_id}: current file quality is not ranked in profile.")
+        _log_decision_event(
+            "radarr_release_eval",
+            movie_id=movie_id,
+            movie_title=movie.get("title", "Unknown Movie"),
+            result="skipped",
+            reason="current_file_unranked",
+            release_count=len(releases),
+        )
         return None
 
     current_quality_rank, current_custom_format_score = current_preference
@@ -51,13 +80,33 @@ def _select_strict_upgrade_candidate(
 
     best_candidate = None
     best_preference = None
+    counts = {
+        "valid_upgrades": 0,
+        "not_approved": 0,
+        "rejected": 0,
+        "download_not_allowed": 0,
+        "unranked_quality": 0,
+        "lower_quality": 0,
+        "same_quality_at_cutoff": 0,
+        "same_quality_insufficient_score": 0,
+    }
 
     for release in releases:
-        if not release.get("approved") or release.get("rejected") or not release.get("downloadAllowed"):
+        if not release.get("approved"):
+            counts["not_approved"] += 1
+            continue
+
+        if release.get("rejected"):
+            counts["rejected"] += 1
+            continue
+
+        if not release.get("downloadAllowed"):
+            counts["download_not_allowed"] += 1
             continue
 
         candidate_preference = _get_release_preference(release, profile_info)
         if candidate_preference is None:
+            counts["unranked_quality"] += 1
             continue
 
         candidate_quality_rank, candidate_custom_format_score = candidate_preference
@@ -65,16 +114,43 @@ def _select_strict_upgrade_candidate(
         if candidate_quality_rank > current_quality_rank:
             is_valid_upgrade = True
         elif candidate_quality_rank == current_quality_rank:
+            if current_custom_format_score >= cutoff_format_score:
+                counts["same_quality_at_cutoff"] += 1
+                continue
+
             is_valid_upgrade = (
-                current_custom_format_score < cutoff_format_score
-                and candidate_custom_format_score >= current_custom_format_score + min_upgrade_format_score
+                candidate_custom_format_score >= current_custom_format_score + min_upgrade_format_score
             )
         else:
-            is_valid_upgrade = False
+            counts["lower_quality"] += 1
+            continue
 
-        if is_valid_upgrade and (best_preference is None or candidate_preference > best_preference):
+        if not is_valid_upgrade:
+            counts["same_quality_insufficient_score"] += 1
+            continue
+
+        counts["valid_upgrades"] += 1
+        if best_preference is None or candidate_preference > best_preference:
             best_candidate = release
             best_preference = candidate_preference
+
+    _log_decision_event(
+        "radarr_release_eval",
+        movie_id=movie_id,
+        movie_title=movie.get("title", "Unknown Movie"),
+        result="selected" if best_candidate is not None else "no_candidate",
+        profile={
+            "id": profile_info.get("id"),
+            "name": profile_info.get("name"),
+            "cutoff_id": profile_info.get("cutoff_id"),
+            "cutoff_format_score": cutoff_format_score,
+            "min_upgrade_format_score": min_upgrade_format_score,
+        },
+        current_file=_release_decision_snapshot(movie_file, profile_info),
+        release_count=len(releases),
+        counts=counts,
+        best_candidate=_release_decision_snapshot(best_candidate, profile_info),
+    )
 
     return best_candidate
 
