@@ -71,12 +71,30 @@ def _build_quality_profile_map(profiles: List[Dict[str, Any]]) -> Dict[int, Dict
             "name": profile.get("name", f"Profile {profile_id}"),
             "upgrade_allowed": profile.get("upgradeAllowed", True),
             "cutoff_id": profile.get("cutoff"),
+            "min_format_score": _coerce_int(profile.get("minFormatScore"), 0),
             "cutoff_format_score": _coerce_int(profile.get("cutoffFormatScore"), 0),
             "min_upgrade_format_score": max(1, _coerce_int(profile.get("minUpgradeFormatScore"), 1)),
+            "format_scores": _build_custom_format_score_map(profile),
             "quality_rank": quality_rank,
         }
 
     return profile_map
+
+
+def _build_custom_format_score_map(profile: Dict[str, Any]) -> Dict[int, int]:
+    format_scores = {}
+
+    for item in profile.get("formatItems", []):
+        custom_format = item.get("format")
+        if isinstance(custom_format, dict):
+            format_id = custom_format.get("id") or item.get("formatId")
+        else:
+            format_id = item.get("formatId") or custom_format
+
+        if format_id is not None:
+            format_scores[format_id] = _coerce_int(item.get("score"), 0)
+
+    return format_scores
 
 
 def arr_request(
@@ -178,6 +196,30 @@ def get_download_queue_size(api_url: str, api_key: str, api_timeout: int) -> int
         return -1
 
 
+def get_indexer_config(api_url: str, api_key: str, api_timeout: int) -> Optional[Dict[str, Any]]:
+    """Get Radarr indexer configuration, including availability delay."""
+    config = arr_request(api_url, api_key, api_timeout, "config/indexer")
+    if isinstance(config, dict):
+        return config
+    radarr_logger.error("Failed to retrieve Radarr indexer configuration.")
+    return None
+
+
+def get_availability_delay_days(api_url: str, api_key: str, api_timeout: int) -> int:
+    """Return Radarr's indexer availability delay in days, defaulting to no delay."""
+    config = get_indexer_config(api_url, api_key, api_timeout)
+    if not config:
+        return 0
+
+    try:
+        return int(config.get("availabilityDelay", 0) or 0)
+    except (TypeError, ValueError):
+        radarr_logger.warning(
+            f"Invalid Radarr availabilityDelay value: {config.get('availabilityDelay')}. Using 0 days."
+        )
+        return 0
+
+
 def get_movies_with_missing(api_url: str, api_key: str, api_timeout: int, monitored_only: bool) -> Optional[List[Dict]]:
     """
     Get a list of movies with missing files (not downloaded/available).
@@ -219,24 +261,66 @@ def get_quality_profile_map(api_url: str, api_key: str, api_timeout: int) -> Opt
     return _build_quality_profile_map(profiles)
 
 
+def _get_movie_file_custom_format_score(movie: Dict[str, Any], profile_info: Dict[str, Any]) -> Optional[int]:
+    """Return a movie file's current custom-format score when Radarr exposes enough data."""
+    movie_file = movie.get("movieFile") or {}
+
+    for source in (movie_file, movie):
+        score = source.get("customFormatScore")
+        if isinstance(score, (int, float)):
+            return int(score)
+
+    custom_formats = movie_file.get("customFormats") or movie.get("customFormats")
+    if not isinstance(custom_formats, list):
+        return None
+
+    total = 0
+    matched_any = False
+    format_scores = profile_info.get("format_scores", {})
+    for custom_format in custom_formats:
+        if not isinstance(custom_format, dict):
+            continue
+        format_id = custom_format.get("id")
+        if format_id in format_scores:
+            total += format_scores[format_id]
+            matched_any = True
+
+    return total if matched_any else None
+
+
+def _is_quality_cutoff_unmet(movie: Dict[str, Any], profile_info: Dict[str, Any]) -> bool:
+    movie_file = movie.get("movieFile") or {}
+    quality_rank = profile_info["quality_rank"]
+    current_quality_id = movie_file.get("quality", {}).get("quality", {}).get("id")
+
+    current_rank = quality_rank.get(current_quality_id)
+    cutoff_rank = quality_rank.get(profile_info["cutoff_id"])
+
+    return current_rank is not None and cutoff_rank is not None and current_rank < cutoff_rank
+
+
+def _is_custom_format_cutoff_unmet(movie: Dict[str, Any], profile_info: Dict[str, Any]) -> bool:
+    current_score = _get_movie_file_custom_format_score(movie, profile_info)
+    if current_score is None:
+        return False
+
+    target_score = max(profile_info.get("min_format_score", 0), profile_info.get("cutoff_format_score", 0))
+    return current_score < target_score
+
+
+def _is_radarr_upgrade_candidate(movie: Dict[str, Any], profile_info: Dict[str, Any]) -> bool:
+    return _is_quality_cutoff_unmet(movie, profile_info) or _is_custom_format_cutoff_unmet(movie, profile_info)
+
+
 def get_cutoff_unmet_movies(api_url: str, api_key: str, api_timeout: int, monitored_only: bool) -> Optional[List[Dict]]:
     """
-    Get a list of movies that don't meet their quality profile cutoff.
+    Get movies that do not meet their quality or custom-format profile cutoffs.
 
-    Args:
-        api_url: The base URL of the Radarr API
-        api_key: The API key for authentication
-        api_timeout: Timeout for the API request
-        monitored_only: If True, only return monitored movies.
-
-    Returns:
-        A list of movie objects that need quality upgrades, or None if the request failed.
+    Radarr's wanted/cutoff behavior is not used here because NeutArr also needs to
+    catch movies that already meet Upgrade Until Quality but have fallen below the
+    profile's custom-format score expectations.
     """
-    # Radarr API endpoint for cutoff unmet movies
-    # Note: Radarr's /api/v3/movie endpoint doesn't directly support a simple 'cutoffUnmet=true' like Sonarr's wanted/cutoff.
-    # We need to fetch all movies and filter locally, or use the /api/v3/movie/lookup endpoint if searching by TMDB/IMDB ID.
-    # Fetching all movies is simpler for now.
-    radarr_logger.debug("Fetching all movies to determine cutoff unmet status...")
+    radarr_logger.debug("Fetching all movies to determine quality/custom-format cutoff status...")
     movies = arr_request(api_url, api_key, api_timeout, "movie")
     if movies is None:
         radarr_logger.error("Failed to retrieve movies from Radarr API for cutoff check.")
@@ -247,35 +331,37 @@ def get_cutoff_unmet_movies(api_url: str, api_key: str, api_timeout: int, monito
         return None
 
     unmet_movies = []
+    quality_unmet_count = 0
+    format_unmet_count = 0
     for movie in movies:
         is_monitored = movie.get("monitored", False)
         has_file = movie.get("hasFile", False)
         profile_id = movie.get("qualityProfileId")
         movie_file = movie.get("movieFile")
 
-        # Apply monitored_only filter if requested
-        if not monitored_only or is_monitored:
-            if has_file and movie_file and profile_id in profile_map:
-                profile_info = profile_map[profile_id]
-                if not profile_info.get("upgrade_allowed", True):
-                    continue
+        if monitored_only and not is_monitored:
+            continue
+        if not has_file or not movie_file or profile_id not in profile_map:
+            continue
 
-                cutoff_id = profile_info["cutoff_id"]
-                quality_rank = profile_info["quality_rank"]
-                current_quality_id = movie_file.get("quality", {}).get("quality", {}).get("id")
-                current_custom_format_score = _coerce_int(movie_file.get("customFormatScore"), 0)
-                cutoff_format_score = _coerce_int(profile_info.get("cutoff_format_score"), 0)
+        profile_info = profile_map[profile_id]
+        if not profile_info.get("upgrade_allowed", True):
+            continue
 
-                # Compare by rank position in the profile, not by raw quality ID
-                current_rank = quality_rank.get(current_quality_id)
-                cutoff_rank = quality_rank.get(cutoff_id)
-                quality_cutoff_not_met = current_rank is not None and cutoff_rank is not None and current_rank < cutoff_rank
-                custom_format_cutoff_not_met = current_custom_format_score < cutoff_format_score
+        quality_unmet = _is_quality_cutoff_unmet(movie, profile_info)
+        format_unmet = _is_custom_format_cutoff_unmet(movie, profile_info)
 
-                if quality_cutoff_not_met or custom_format_cutoff_not_met:
-                    unmet_movies.append(movie)
+        if quality_unmet or format_unmet:
+            unmet_movies.append(movie)
+            if quality_unmet:
+                quality_unmet_count += 1
+            if format_unmet:
+                format_unmet_count += 1
 
-    radarr_logger.debug(f"Found {len(unmet_movies)} cutoff unmet movies (monitored_only={monitored_only}).")
+    radarr_logger.debug(
+        f"Found {len(unmet_movies)} Radarr upgrade candidates "
+        f"({quality_unmet_count} quality cutoff, {format_unmet_count} custom-format score; monitored_only={monitored_only})."
+    )
     return unmet_movies
 
 

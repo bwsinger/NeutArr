@@ -130,7 +130,7 @@ All configuration is done through the web UI. Settings are persisted to `/config
 - **Scheduling** — automated search windows per app
 - **Security** — auth mode selection (standard, local bypass, proxy bypass)
 - **Account & API** — username, password, and API key management inside Settings
-- **Swaparr** — stalled download detection thresholds and removal settings
+- **Swaparr** — per-instance enable toggles, stalled download detection thresholds, and removal settings
 
 ## Why v6.6.3?
 
@@ -176,20 +176,37 @@ NeutArr forks at **v6.6.3**: multi-instance + Swaparr, before the Requestarr/Pro
 
 ## Development
 
-The project ships a devcontainer. Open in VS Code with the Dev Containers extension — Poetry and all dependencies install automatically.
+The project ships a devcontainer. Open in VS Code with the Dev Containers extension — Poetry and all dependencies install automatically into the repo-local `.venv`.
+
+NeutArr does not use a Node/pnpm frontend build. The frontend files are checked-in Flask templates and static assets, so use Poetry and Make for local development.
 
 ```bash
+# Install dependencies
+poetry install --no-root --with dev
+
 # Run locally
 DEBUG=true poetry run python main.py
 # → http://localhost:9705
 
-# Lint
-poetry run ruff check .
-poetry run ruff format --check .
+# Run the standard local verification suite
+make verify
+
+# Optional: install git hooks
+make pre-commit-install
+
+# Individual checks
+make lint
+make format-check
+make compile
+make test
 
 # Security scan
-poetry run bandit -r src/ main.py -ll
+make security
 ```
+
+If an older devcontainer was created before the repo-local `.venv` workflow, rebuild the container or run `poetry env remove --all && poetry install --no-root --with dev` from `/app`. Avoid disabling Poetry virtualenvs in the devcontainer; doing so can make `poetry update` try to modify root-owned system packages.
+
+The automated test suite includes application smoke tests for the Flask app, auth setup flow, health/version endpoints, default config JSON, required frontend assets, and focused unit tests for helper logic. CI runs the same unittest discovery command on pull requests.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) to contribute.
 

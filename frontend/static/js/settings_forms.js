@@ -164,6 +164,14 @@ const SettingsForms = {
             }];
         }
         
+        const configuredReleaseTypes = Array.isArray(settings.release_types)
+            ? settings.release_types
+            : [settings.release_type || 'physical'];
+        const selectedReleaseTypes = new Set(
+            configuredReleaseTypes.filter(type => ['digital', 'physical', 'cinema'].includes(type))
+        );
+        if (selectedReleaseTypes.size === 0) selectedReleaseTypes.add('physical');
+
         // Create a container for instances with a scrollable area for many instances
         let instancesHtml = `
             <div class="settings-group">
@@ -271,13 +279,13 @@ const SettingsForms = {
                     <p class="setting-help">Skip searching for movies with future release dates</p>
                 </div>
                 <div class="setting-item" id="future_release_type_container" style="${settings.skip_future_releases !== false ? '' : 'display: none;'}">
-                    <label for="radarr_release_type"><span class="info-icon" title="Which release date type determines future status (e.g. digital, physical)"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Release Type for Future Status:</label>
-                    <select id="radarr_release_type">
-                        <option value="digital" ${settings.release_type === 'digital' ? 'selected' : ''}>Digital Release</option>
-                        <option value="physical" ${settings.release_type === 'physical' || !settings.release_type ? 'selected' : ''}>Physical Release</option>
-                        <option value="cinema" ${settings.release_type === 'cinema' ? 'selected' : ''}>Cinema Release</option>
-                    </select>
-                    <p class="setting-help">Select which release date type to use when determining if a movie is considered a future release</p>
+                    <label><span class="info-icon" title="Which release date types determine future status"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Release Types for Future Status:</label>
+                    <div class="checkbox-group" id="radarr_release_types">
+                        <label><input type="checkbox" name="radarr_release_types" value="digital" ${selectedReleaseTypes.has('digital') ? 'checked' : ''}> Digital Release</label>
+                        <label><input type="checkbox" name="radarr_release_types" value="physical" ${selectedReleaseTypes.has('physical') ? 'checked' : ''}> Physical Release</label>
+                        <label><input type="checkbox" name="radarr_release_types" value="cinema" ${selectedReleaseTypes.has('cinema') ? 'checked' : ''}> Cinema Release</label>
+                    </div>
+                    <p class="setting-help">Select one or more release date types. A movie is eligible once any selected release date has passed.</p>
                 </div>
             </div>
         `;
@@ -834,9 +842,71 @@ const SettingsForms = {
     },
     
     // Generate Swaparr settings form
-    generateSwaparrForm: function(container, settings = {}) {
+    generateSwaparrForm: function(container, settings = {}, allSettings = null) {
         // Add data-app-type attribute to container
         container.setAttribute('data-app-type', 'swaparr');
+
+        const swaparrApps = [
+            ['sonarr', 'Sonarr'],
+            ['radarr', 'Radarr'],
+            ['lidarr', 'Lidarr'],
+            ['readarr', 'Readarr'],
+            ['whisparr', 'Whisparr'],
+            ['eros', 'Eros']
+        ];
+        const appEnabled = settings.app_enabled && typeof settings.app_enabled === 'object' ? settings.app_enabled : {};
+        const appInstances = settings.app_instances && typeof settings.app_instances === 'object' ? settings.app_instances : {};
+        const sourceSettings = allSettings || window.neutarrUI?.originalSettings || {};
+        const escapeHtml = window.NeutArrUtils?.escapeHtml || function(value) {
+            return String(value).replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            })[char]);
+        };
+        const escapeAttr = escapeHtml;
+
+        const getConfiguredInstances = (app) => {
+            const appForm = document.getElementById(`${app}Settings`);
+            if (appForm) {
+                const formInstances = Array.from(appForm.querySelectorAll('.instance-item, .instance-panel'))
+                    .map((instance, index) => {
+                        const name = instance.querySelector('input[name="name"]')?.value?.trim();
+                        return { name: name || `Instance ${index + 1}` };
+                    });
+                if (formInstances.length > 0) return formInstances;
+            }
+
+            if (Array.isArray(sourceSettings[app]?.instances) && sourceSettings[app].instances.length > 0) {
+                return sourceSettings[app].instances;
+            }
+
+            return [{ name: 'Default' }];
+        };
+
+        const instanceToggleHtml = swaparrApps.map(([app, label]) => {
+            const instances = getConfiguredInstances(app);
+            const instanceToggles = appInstances[app] && typeof appInstances[app] === 'object' ? appInstances[app] : {};
+            const rows = instances.map((instance, index) => {
+                const instanceName = instance.name || `Instance ${index + 1}`;
+                const enabled = instanceToggles[instanceName] === true;
+                const checked = settings.enabled ? enabled : false;
+                return `
+                            <label><input type="checkbox" name="swaparr_instance_enabled" data-app="${app}" data-instance="${escapeAttr(instanceName)}" data-default-enabled="${enabled ? 'true' : 'false'}" ${checked ? 'checked' : ''} ${settings.enabled ? '' : 'disabled'}> ${escapeHtml(instanceName)}</label>
+                `;
+            }).join('');
+
+            return `
+                        <div class="swaparr-app-instance-group">
+                            <strong>${label}</strong>
+                            <div class="checkbox-group">
+                                ${rows}
+                            </div>
+                        </div>
+            `;
+        }).join('');
         
         container.innerHTML = `
             <div class="settings-group">
@@ -855,6 +925,13 @@ const SettingsForms = {
                         <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                     </label>
                     <p class="setting-help">Enable automatic handling of stalled downloads</p>
+                </div>
+                <div class="setting-item">
+                    <label><span class="info-icon" title="Choose which app instances Swaparr manages"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enabled Instances:</label>
+                    <div id="swaparr_app_instances">
+                        ${instanceToggleHtml}
+                    </div>
+                    <p class="setting-help">Disable Swaparr for individual instances where stalled downloads should be left alone.</p>
                 </div>
                 <div class="setting-item">
                     <label for="swaparr_max_strikes"><span class="info-icon" title="Number of strikes before a stalled download is removed"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Maximum Strikes:</label>
@@ -903,6 +980,17 @@ const SettingsForms = {
                 </div>
             </div>
         `;
+
+        const swaparrEnabledInput = container.querySelector('#swaparr_enabled');
+        const syncInstanceToggles = () => {
+            const enabled = swaparrEnabledInput?.checked === true;
+            container.querySelectorAll('input[name="swaparr_instance_enabled"]').forEach(input => {
+                input.disabled = !enabled;
+                input.checked = enabled ? input.dataset.defaultEnabled !== 'false' : false;
+            });
+        };
+        swaparrEnabledInput?.addEventListener('change', syncInstanceToggles);
+        syncInstanceToggles();
         
         // Load Swaparr status automatically
         const resetStrikesBtn = container.querySelector('#reset_swaparr_strikes');
@@ -1153,7 +1241,11 @@ const SettingsForms = {
                 settings.monitored_only = getInputValue('#radarr_monitored_only', true);
                 settings.skip_future_releases = getInputValue('#radarr_skip_future_releases', true);
 
-                settings.release_type = getInputValue('#radarr_release_type', 'physical');
+                const selectedReleaseTypes = Array.from(
+                    container.querySelectorAll('input[name="radarr_release_types"]:checked')
+                ).map(input => input.value);
+                settings.release_types = selectedReleaseTypes.length ? selectedReleaseTypes : ['physical'];
+                settings.release_type = settings.release_types[0];
             } 
             else if (appType === 'lidarr') {
                 settings.hunt_missing_items = getInputValue('#lidarr_hunt_missing_items', 1);
@@ -1199,6 +1291,22 @@ const SettingsForms = {
                 settings.ignore_above_size = getInputValue('#swaparr_ignore_above_size', '25GB');
                 settings.remove_from_client = getInputValue('#swaparr_remove_from_client', true);
                 settings.dry_run = getInputValue('#swaparr_dry_run', false);
+
+                settings.app_enabled = {};
+                settings.app_instances = {};
+                ['sonarr', 'radarr', 'lidarr', 'readarr', 'whisparr', 'eros'].forEach(app => {
+                    settings.app_enabled[app] = false;
+                    settings.app_instances[app] = {};
+                });
+                container.querySelectorAll('input[name="swaparr_instance_enabled"]').forEach(input => {
+                    const app = input.dataset.app;
+                    const instance = input.dataset.instance;
+                    if (!app || !instance) return;
+                    if (!settings.app_instances[app]) settings.app_instances[app] = {};
+                    const enabled = settings.enabled ? input.checked : input.dataset.defaultEnabled !== 'false';
+                    settings.app_instances[app][instance] = enabled;
+                    if (enabled) settings.app_enabled[app] = true;
+                });
             }
         }
         
