@@ -100,8 +100,8 @@ This fork carries a small set of personal changes focused on making upgrade sear
 ### Upgrade Diagnostics
 
 - **Issue:** Upgrade decisions were hard to reconstruct from ordinary logs.
-- **Change:** Radarr and Sonarr upgrade paths now emit bounded structured `AI_EVENT` debug logs for samples, skipped candidates, selected releases or seasons, threshold failures, and completion events.
-- **Result:** It is easier to see why NeutArr did or did not trigger an upgrade without reading scattered free-form log lines.
+- **Change:** Radarr and Sonarr upgrade paths now log selected releases, season-pack thresholds, filtered episodes, and completed upgrade actions.
+- **Result:** It is easier to see why NeutArr did or did not trigger an upgrade without enabling a separate diagnostics system.
 
 NeutArr traces its code lineage from [Huntarr](https://github.com/plexguide/Huntarr.io) v6.6.3 — the last clean release before the project was abandoned under [controversial circumstances](https://www.reddit.com/r/selfhosted/comments/1rckopd/huntarr_your_passwords_and_your_entire_arr_stacks/) — through ElfHosted's [NewtArr](https://github.com/elfhosted/newtarr) v1.0.0, which served as the starting point for this project.
 
