@@ -3,9 +3,9 @@
 from flask import Blueprint, request, jsonify
 import datetime, os, requests
 from src.primary.state import get_state_file_path, reset_state_file
+from src.primary.log_redaction import redact_sensitive_data
 from src.primary.utils.logger import get_logger, APP_LOG_FILES
 from src.primary.settings_manager import load_settings, get_ssl_verify_setting
-import traceback
 import socket
 from urllib.parse import urlparse
 from src.primary.apps.whisparr import api as whisparr_api
@@ -32,7 +32,7 @@ def get_status():
         for instance in instances:
             api_url = instance.get("api_url")
             api_key = instance.get("api_key")
-            if api_url and api_key and instance.get("enabled", True):
+            if api_url and api_key and instance.get("enabled", False):
                 # Use a short timeout for status checks
                 if whisparr_api.check_connection(api_url, api_key, 5):
                     connected_count += 1
@@ -45,8 +45,8 @@ def get_status():
                 "total_configured": total_configured,
             }
         )
-    except Exception as e:
-        whisparr_logger.error(f"Error getting Whisparr status: {str(e)}")
+    except Exception:
+        whisparr_logger.error("Error getting Whisparr status; details omitted")
         return jsonify({"configured": False, "connected": False, "error": "Failed to get Whisparr status"}), 500
 
 
@@ -91,9 +91,9 @@ def test_connection():
         error_msg = "DNS resolution failed - Unable to resolve the configured hostname. Please check the URL."
         whisparr_logger.error(error_msg)
         return jsonify({"success": False, "message": error_msg}), 404
-    except Exception as e:
+    except Exception:
         # Log the socket testing error but continue with the full request
-        whisparr_logger.debug(f"Socket test error, continuing with full request: {str(e)}")
+        whisparr_logger.debug("Whisparr socket preflight failed; continuing with the full request")
 
     # First try standard API endpoint (Whisparr v2)
     api_paths = [
@@ -116,7 +116,7 @@ def test_connection():
     for api_path in api_paths:
         try:
             url = api_path["url"]
-            whisparr_logger.debug(f"Trying API path: {url}")
+            whisparr_logger.debug("Trying Whisparr %s API path", api_path["version"])
             response = requests.get(url, headers=headers, timeout=(10, api_timeout), verify=verify_ssl)
 
             if response.status_code == 200:
@@ -161,7 +161,7 @@ def test_connection():
     try:
         response_data = response.json()
         version = response_data.get("version", "unknown")
-        whisparr_logger.info(f"Successfully connected to Whisparr API version: {version} (API {detected_version})")
+        whisparr_logger.info("Successfully connected to a compatible Whisparr API")
 
         # Check if this is a v2 version
         if version and version.startswith("2"):
@@ -185,7 +185,7 @@ def test_connection():
             return jsonify({"success": False, "message": error_msg}), 400
     except ValueError:
         error_msg = "Invalid JSON response from Whisparr API - This doesn't appear to be a valid Whisparr server"
-        whisparr_logger.error(f"{error_msg}. Response content: {response.text[:200]}")
+        whisparr_logger.error("Whisparr API returned invalid JSON; response body omitted")
         return jsonify({"success": False, "message": error_msg}), 500
     except requests.exceptions.ConnectionError as e:
         # Handle different types of connection errors
@@ -213,7 +213,7 @@ def test_connection():
 def is_configured():
     """Check if Whisparr API credentials are configured"""
     instances = load_settings("whisparr").get("instances", [])
-    return any(inst.get("enabled", True) and inst.get("api_url") and inst.get("api_key") for inst in instances)
+    return any(inst.get("enabled", False) and inst.get("api_url") and inst.get("api_key") for inst in instances)
 
 
 @whisparr_bp.route("/versions", methods=["GET"])
@@ -229,7 +229,7 @@ def get_versions():
 
         results = []
         for instance in instances:
-            if not instance.get("enabled", True):
+            if not instance.get("enabled", False):
                 continue
 
             api_url = instance.get("api_url")
@@ -249,7 +249,7 @@ def get_versions():
 
                 # If we get a 404, try with the v3 path
                 if response.status_code == 404:
-                    whisparr_logger.debug(f"Standard API path failed for {instance_name}, trying v3 path")
+                    whisparr_logger.debug("Standard Whisparr API path returned 404; trying v3 path")
                     v3_url = f"{api_url.rstrip('/')}/api/v3/system/status"
                     response = requests.get(v3_url, headers=headers, timeout=10)
 
@@ -293,8 +293,8 @@ def get_versions():
                 results.append({"name": instance_name, "success": False, "message": "Connection error"})
 
         return jsonify({"success": True, "results": results})
-    except Exception as e:
-        whisparr_logger.error(f"Error getting Whisparr versions: {str(e)}")
+    except Exception:
+        whisparr_logger.error("Error getting Whisparr versions; details omitted")
         return jsonify({"success": False, "message": "Failed to get Whisparr versions"}), 500
 
 
@@ -311,13 +311,13 @@ def get_logs():
         # Read the log file (last 200 lines)
         with open(log_file, "r") as f:
             lines = f.readlines()
-            log_content = "".join(lines[-200:])
+            log_content = redact_sensitive_data("".join(lines[-200:]))
 
-        return jsonify({"success": True, "logs": log_content})
-    except Exception as e:
-        error_message = f"Error fetching Whisparr logs: {str(e)}"
-        whisparr_logger.error(error_message)
-        traceback.print_exc()
+        response = jsonify({"success": True, "logs": log_content})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except Exception:
+        whisparr_logger.error("Error fetching Whisparr logs; details omitted")
         return jsonify({"success": False, "message": "Failed to fetch Whisparr logs"}), 500
 
 
@@ -334,7 +334,6 @@ def clear_processed():
         reset_state_file("whisparr", "processed_upgrades")
 
         return jsonify({"success": True, "message": "Successfully cleared Whisparr processed state"})
-    except Exception as e:
-        error_message = f"Error clearing Whisparr processed state: {str(e)}"
-        whisparr_logger.error(error_message)
+    except Exception:
+        whisparr_logger.error("Error clearing Whisparr processed state; details omitted")
         return jsonify({"success": False, "message": "Failed to clear Whisparr processed state"}), 500

@@ -10,11 +10,16 @@ import threading
 import datetime
 import time
 import traceback
-from typing import Dict, List, Any
+import pathlib
+import shutil
+import stat
+import tempfile
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Tuple
 import collections
 
-# Import settings_manager to handle cache refreshing
-from src.primary.settings_manager import clear_cache
+# Import settings_manager for validated, atomic configuration updates
+from src.primary import settings_manager
 
 from src.primary.utils.logger import get_logger
 
@@ -25,7 +30,18 @@ scheduler_logger = get_logger("scheduler")
 SCHEDULE_CHECK_INTERVAL = 60  # Check schedule every minute
 SCHEDULE_DIR = os.path.join(os.environ.get("NEUTARR_CONFIG_DIR", "/config"), "scheduler")
 SCHEDULE_FILE = os.path.join(SCHEDULE_DIR, "schedule.json")
-_CONFIG_DIR = os.environ.get("NEUTARR_CONFIG_DIR", "/config")
+SCHEDULABLE_APP_TYPES = ("sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros")
+SCHEDULE_GROUPS = ("global", *SCHEDULABLE_APP_TYPES)
+SCHEDULE_DAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+MAX_SCHEDULE_ENTRIES = 1000
 
 # Track last executed actions to prevent duplicates
 last_executed_actions = {}
@@ -36,82 +52,316 @@ execution_history = collections.deque(maxlen=max_history_entries)
 
 stop_event = threading.Event()
 scheduler_thread = None
+_schedule_file_lock = threading.RLock()
+
+
+class ScheduleValidationError(ValueError):
+    """Raised when a schedule payload cannot be persisted safely."""
+
+
+def _empty_schedule() -> Dict[str, List[Dict[str, Any]]]:
+    """Return a new schedule structure with every supported group."""
+    return {group: [] for group in SCHEDULE_GROUPS}
+
+
+def _normalize_schedule_days(days: Any, entry_label: str) -> List[str]:
+    """Validate and normalize full or abbreviated weekday names."""
+    if not isinstance(days, list):
+        raise ScheduleValidationError(f"{entry_label}.days must be an array")
+
+    normalized_days = []
+    for day in days:
+        if not isinstance(day, str):
+            raise ScheduleValidationError(f"{entry_label}.days must contain only strings")
+        normalized_day = day.strip().lower()
+        matches = [weekday for weekday in SCHEDULE_DAYS if weekday.startswith(normalized_day)]
+        if len(normalized_day) < 3 or len(matches) != 1:
+            raise ScheduleValidationError(f"{entry_label}.days contains an invalid weekday")
+        weekday = matches[0]
+        if weekday not in normalized_days:
+            normalized_days.append(weekday)
+    return normalized_days
+
+
+def _normalize_schedule_time(schedule: Dict[str, Any], entry_label: str) -> Dict[str, int]:
+    """Validate current and legacy schedule time representations."""
+    schedule_time = schedule.get("time")
+    if isinstance(schedule_time, str):
+        try:
+            hour_text, minute_text = schedule_time.split(":", maxsplit=1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+        except (TypeError, ValueError):
+            raise ScheduleValidationError(f"{entry_label}.time must use HH:MM") from None
+    elif isinstance(schedule_time, dict):
+        hour = schedule_time.get("hour")
+        minute = schedule_time.get("minute")
+    elif "hour" in schedule or "minute" in schedule:
+        hour = schedule.get("hour")
+        minute = schedule.get("minute")
+    else:
+        raise ScheduleValidationError(f"{entry_label}.time is required")
+
+    if (
+        isinstance(hour, bool)
+        or not isinstance(hour, int)
+        or isinstance(minute, bool)
+        or not isinstance(minute, int)
+        or not 0 <= hour <= 23
+        or not 0 <= minute <= 59
+    ):
+        raise ScheduleValidationError(f"{entry_label}.time must contain a valid hour and minute")
+    return {"hour": hour, "minute": minute}
+
+
+def _validate_schedule_action(action: Any, entry_label: str) -> str:
+    """Validate supported current and legacy scheduler actions."""
+    if not isinstance(action, str):
+        raise ScheduleValidationError(f"{entry_label}.action must be a string")
+    if action in {"enable", "disable", "pause", "resume"}:
+        return action
+
+    prefix = "api-" if action.startswith("api-") else "API Limits " if action.startswith("API Limits ") else None
+    if prefix is None:
+        raise ScheduleValidationError(f"{entry_label}.action is not supported")
+    try:
+        api_limit = int(action.removeprefix(prefix))
+    except ValueError:
+        raise ScheduleValidationError(f"{entry_label}.action has an invalid API limit") from None
+    if not 1 <= api_limit <= 500:
+        raise ScheduleValidationError(f"{entry_label}.action API limit must be between 1 and 500")
+    return action
+
+
+def validate_schedule_data(schedule_data: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Validate and normalize a complete schedule document."""
+    if not isinstance(schedule_data, dict):
+        raise ScheduleValidationError("Schedule data must be a JSON object")
+    if not schedule_data:
+        raise ScheduleValidationError("Schedule data must contain at least one application group")
+
+    unknown_groups = set(schedule_data) - set(SCHEDULE_GROUPS)
+    if unknown_groups:
+        raise ScheduleValidationError("Schedule data contains an unsupported application group")
+
+    normalized_data = _empty_schedule()
+    seen_ids = set()
+    entry_count = 0
+
+    for group in SCHEDULE_GROUPS:
+        entries = schedule_data.get(group, [])
+        if not isinstance(entries, list):
+            raise ScheduleValidationError(f"{group} schedules must be an array")
+
+        for index, schedule in enumerate(entries):
+            entry_count += 1
+            if entry_count > MAX_SCHEDULE_ENTRIES:
+                raise ScheduleValidationError(f"Schedule data may contain at most {MAX_SCHEDULE_ENTRIES} entries")
+
+            entry_label = f"{group}[{index}]"
+            if not isinstance(schedule, dict):
+                raise ScheduleValidationError(f"{entry_label} must be an object")
+
+            schedule_id = schedule.get("id")
+            if not isinstance(schedule_id, str) or not schedule_id.strip() or len(schedule_id) > 128:
+                raise ScheduleValidationError(f"{entry_label}.id must be a non-empty string up to 128 characters")
+            schedule_id = schedule_id.strip()
+            if schedule_id in seen_ids:
+                raise ScheduleValidationError(f"{entry_label}.id must be unique")
+            seen_ids.add(schedule_id)
+
+            target = schedule.get("app")
+            if _resolve_schedule_target(target) is None:
+                raise ScheduleValidationError(f"{entry_label}.app is not a supported target")
+
+            enabled = schedule.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise ScheduleValidationError(f"{entry_label}.enabled must be true or false")
+
+            normalized_data[group].append(
+                {
+                    "id": schedule_id,
+                    "time": _normalize_schedule_time(schedule, entry_label),
+                    "days": _normalize_schedule_days(schedule.get("days", []), entry_label),
+                    "action": _validate_schedule_action(schedule.get("action"), entry_label),
+                    "app": target,
+                    "enabled": enabled,
+                    "appType": group,
+                }
+            )
+
+    return normalized_data
+
+
+def _atomic_write_schedule(schedule_data: Dict[str, List[Dict[str, Any]]]) -> None:
+    """Durably replace schedule.json without exposing a partial document."""
+    schedule_file = pathlib.Path(SCHEDULE_FILE)
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode = stat.S_IMODE(schedule_file.stat().st_mode) if schedule_file.exists() else 0o600
+    file_descriptor = None
+    temp_path = None
+
+    try:
+        file_descriptor, temp_name = tempfile.mkstemp(
+            dir=schedule_file.parent,
+            prefix=f".{schedule_file.name}.",
+            suffix=".tmp",
+        )
+        temp_path = pathlib.Path(temp_name)
+        os.fchmod(file_descriptor, existing_mode)
+
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temp_file:
+            file_descriptor = None
+            json.dump(schedule_data, temp_file, indent=2)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(temp_path, schedule_file)
+        temp_path = None
+
+        try:
+            directory_descriptor = os.open(schedule_file.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as error:
+            scheduler_logger.debug(f"Unable to fsync scheduler directory {schedule_file.parent}: {error}")
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def save_schedule(schedule_data: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Validate and atomically persist a complete schedule document."""
+    normalized_data = validate_schedule_data(deepcopy(schedule_data))
+    with _schedule_file_lock:
+        _atomic_write_schedule(normalized_data)
+    return normalized_data
+
+
+def _resolve_schedule_target(target: Any) -> Optional[Tuple[str, Optional[int]]]:
+    """Resolve UI and legacy scheduler target values to a config and instance."""
+    if target == "global":
+        return "global", None
+
+    if not isinstance(target, str):
+        return None
+
+    aliases = {
+        "whisparr-v2": "whisparr",
+        "whisparr-v3": "eros",
+    }
+    if target in aliases:
+        return aliases[target], None
+
+    if target in SCHEDULABLE_APP_TYPES:
+        return target, None
+
+    for app_type in SCHEDULABLE_APP_TYPES:
+        prefix = f"{app_type}-"
+        if not target.startswith(prefix):
+            continue
+
+        target_suffix = target.removeprefix(prefix)
+        if target_suffix == "all":
+            return app_type, None
+        if target_suffix.isdecimal():
+            return app_type, int(target_suffix)
+        return None
+
+    return None
+
+
+def _set_enabled(config_data: Dict[str, Any], enabled: bool, instance_index: Optional[int] = None) -> None:
+    """Apply a scheduled enabled state to all instances or one instance."""
+    instances = config_data.get("instances")
+    if instance_index is not None:
+        if not isinstance(instances, list) or instance_index >= len(instances):
+            raise ValueError(f"Unknown instance index: {instance_index}")
+        instance = instances[instance_index]
+        if not isinstance(instance, dict):
+            raise ValueError(f"Invalid instance entry at index: {instance_index}")
+        instance["enabled"] = enabled
+        config_data["enabled"] = any(
+            isinstance(candidate, dict) and candidate.get("enabled", False) for candidate in instances
+        )
+        return
+
+    config_data["enabled"] = enabled
+    if not isinstance(instances, list):
+        return
+    for instance in instances:
+        if isinstance(instance, dict):
+            instance["enabled"] = enabled
+
+
+def _set_hourly_cap(config_data: Dict[str, Any], hourly_cap: int) -> None:
+    """Apply a scheduled hourly API cap."""
+    config_data["hourly_cap"] = hourly_cap
+
+
+def _update_scheduled_app_settings(app_type: str, update_callback) -> bool:
+    """Apply one update to a validated app target or every schedulable app."""
+    target_apps = SCHEDULABLE_APP_TYPES if app_type == "global" else (app_type,)
+    updated_apps = []
+
+    for target_app in target_apps:
+        settings_file = settings_manager.get_settings_file_path(target_app)
+        if not settings_file.exists():
+            if app_type != "global":
+                scheduler_logger.error(
+                    f"Unable to apply scheduled update for {target_app}; settings file does not exist"
+                )
+                return False
+            scheduler_logger.debug(f"Skipping unconfigured app {target_app} during global scheduled update")
+            continue
+        if not settings_manager.update_settings(target_app, update_callback):
+            return False
+        updated_apps.append(target_app)
+
+    if not updated_apps:
+        scheduler_logger.error(
+            f"Unable to apply scheduled update for {app_type}; no configured app settings were found"
+        )
+        return False
+
+    return True
 
 
 def load_schedule():
-    """Load the schedule configuration from file"""
+    """Load and validate schedule.json, repairing malformed files safely."""
+    default_schedule = _empty_schedule()
+    schedule_file = pathlib.Path(SCHEDULE_FILE)
+
     try:
-        os.makedirs(SCHEDULE_DIR, exist_ok=True)  # Ensure directory exists
-
-        if os.path.exists(SCHEDULE_FILE):
-            try:
-                # Check if file is empty
-                if os.path.getsize(SCHEDULE_FILE) == 0:
-                    return {
-                        "global": [],
-                        "sonarr": [],
-                        "radarr": [],
-                        "lidarr": [],
-                        "readarr": [],
-                        "whisparr": [],
-                        "eros": [],
-                    }
-
-                # Attempt to load JSON
-                with open(SCHEDULE_FILE, "r") as f:
-                    content = f.read()
-                    scheduler_logger.debug(f"Schedule file content (first 100 chars): {content[:100]}...")
-                    schedule_data = json.loads(content)
-
-                    # Ensure the schedule data has the expected structure
-                    for app_type in ["global", "sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros"]:
-                        if app_type not in schedule_data:
-                            schedule_data[app_type] = []
-
-                    return schedule_data
-            except json.JSONDecodeError as json_err:
-                scheduler_logger.error(f"Invalid JSON in schedule file: {json_err}")
-                scheduler_logger.error(f"Attempting to repair JSON file...")
-
-                # Backup the corrupted file
-                backup_file = f"{SCHEDULE_FILE}.backup.{int(time.time())}"
-                os.rename(SCHEDULE_FILE, backup_file)
-                scheduler_logger.info(f"Backed up corrupted file to {backup_file}")
-
-                # Create a new empty schedule file
-                default_schedule = {
-                    "global": [],
-                    "sonarr": [],
-                    "radarr": [],
-                    "lidarr": [],
-                    "readarr": [],
-                    "whisparr": [],
-                    "eros": [],
-                }
-                with open(SCHEDULE_FILE, "w") as f:
-                    json.dump(default_schedule, f, indent=2)
-                scheduler_logger.info(f"Created new empty schedule file")
-
+        with _schedule_file_lock:
+            schedule_file.parent.mkdir(parents=True, exist_ok=True)
+            if not schedule_file.exists():
+                _atomic_write_schedule(default_schedule)
+                scheduler_logger.info("Created new schedule file with default structure")
                 return default_schedule
-        else:
-            # Create the default schedule file
-            default_schedule = {
-                "global": [],
-                "sonarr": [],
-                "radarr": [],
-                "lidarr": [],
-                "readarr": [],
-                "whisparr": [],
-                "eros": [],
-            }
-            with open(SCHEDULE_FILE, "w") as f:
-                json.dump(default_schedule, f, indent=2)
-            scheduler_logger.info(f"Created new schedule file with default structure")
-            return default_schedule
+
+            try:
+                content = schedule_file.read_text(encoding="utf-8")
+                if not content.strip():
+                    raise ScheduleValidationError("Schedule file is empty")
+                return validate_schedule_data(json.loads(content))
+            except (json.JSONDecodeError, ScheduleValidationError) as error:
+                scheduler_logger.error(f"Invalid schedule file: {error}")
+                backup_file = schedule_file.with_name(f"{schedule_file.name}.backup.{time.time_ns()}")
+                shutil.copy2(schedule_file, backup_file)
+                _atomic_write_schedule(default_schedule)
+                scheduler_logger.info(f"Backed up invalid schedule file to {backup_file}")
+                scheduler_logger.info("Created new empty schedule file")
+                return default_schedule
     except Exception as e:
         scheduler_logger.error(f"Error loading schedule: {e}")
         scheduler_logger.error(traceback.format_exc())
-        return {"global": [], "sonarr": [], "radarr": [], "lidarr": [], "readarr": [], "whisparr": [], "eros": []}
+        return default_schedule
 
 
 def add_to_history(action_entry, status, message):
@@ -134,19 +384,41 @@ def add_to_history(action_entry, status, message):
     )
 
 
-def execute_action(action_entry):
+def execute_action(action_entry, scheduled_for=None):
     """Execute a scheduled action"""
+    if not isinstance(action_entry, dict):
+        scheduler_logger.error("Refused malformed scheduler action: expected an object")
+        return False
+
     action_type = action_entry.get("action")
-    app_type = action_entry.get("app")
+    raw_target = action_entry.get("app")
     app_id = action_entry.get("id")
 
-    # Generate a unique key for this action to track execution
-    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    execution_key = f"{app_id}_{current_date}"
+    if not isinstance(action_type, str):
+        message = "Invalid scheduler action type"
+        scheduler_logger.error(message)
+        add_to_history(action_entry, "error", message)
+        return False
 
-    # Check if this action was already executed today
+    resolved_target = _resolve_schedule_target(raw_target)
+    if resolved_target is None:
+        message = f"Invalid scheduler app target: {raw_target}"
+        scheduler_logger.error(message)
+        add_to_history(action_entry, "error", message)
+        return False
+    app_type, instance_index = resolved_target
+
+    if isinstance(scheduled_for, datetime.datetime):
+        execution_date = scheduled_for.date()
+    elif isinstance(scheduled_for, datetime.date):
+        execution_date = scheduled_for
+    else:
+        execution_date = datetime.datetime.now().date()
+    execution_key = f"{app_id}_{execution_date.isoformat()}"
+
+    # Check if this action was already executed for this scheduled occurrence
     if execution_key in last_executed_actions:
-        message = f"Action {app_id} for {app_type} already executed today, skipping"
+        message = f"Action {app_id} for {app_type} already executed for {execution_date.isoformat()}, skipping"
         scheduler_logger.debug(message)
         add_to_history(action_entry, "skipped", message)
         return False  # Already executed
@@ -154,123 +426,45 @@ def execute_action(action_entry):
     try:
         # Handle both old "pause" and new "disable" terminology
         if action_type == "pause" or action_type == "disable":
-            # Disable logic for global or specific app
             if app_type == "global":
                 message = "Executing global pause action"
-                scheduler_logger.info(message)
-                try:
-                    apps = ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros"]
-                    for app in apps:
-                        config_file = f"{_CONFIG_DIR}/{app}.json"
-                        if os.path.exists(config_file):
-                            with open(config_file, "r") as f:
-                                config_data = json.load(f)
-                            # Update root level enabled field
-                            config_data["enabled"] = False
-                            # Also update enabled field in instances array if it exists
-                            if "instances" in config_data and isinstance(config_data["instances"], list):
-                                for instance in config_data["instances"]:
-                                    if isinstance(instance, dict):
-                                        instance["enabled"] = False
-                            with open(config_file, "w") as f:
-                                json.dump(config_data, f, indent=2)
-                            # Clear cache for this app to ensure the UI refreshes
-                            clear_cache(app)
-                    result_message = "All apps disabled successfully"
-                    scheduler_logger.info(result_message)
-                    add_to_history(action_entry, "success", result_message)
-                except Exception as e:
-                    error_message = f"Error disabling all apps: {str(e)}"
-                    scheduler_logger.error(error_message)
-                    add_to_history(action_entry, "error", error_message)
-                    return False
+                result_message = "All apps disabled successfully"
             else:
                 message = f"Executing disable action for {app_type}"
-                scheduler_logger.info(message)
-                try:
-                    config_file = f"{_CONFIG_DIR}/{app_type}.json"
-                    if os.path.exists(config_file):
-                        with open(config_file, "r") as f:
-                            config_data = json.load(f)
-                        # Update root level enabled field
-                        config_data["enabled"] = False
-                        # Also update enabled field in instances array if it exists
-                        if "instances" in config_data and isinstance(config_data["instances"], list):
-                            for instance in config_data["instances"]:
-                                if isinstance(instance, dict):
-                                    instance["enabled"] = False
-                        with open(config_file, "w") as f:
-                            json.dump(config_data, f, indent=2)
-                        # Clear cache for this app to ensure the UI refreshes
-                        clear_cache(app_type)
-                    result_message = f"{app_type} disabled successfully"
-                    scheduler_logger.info(result_message)
-                    add_to_history(action_entry, "success", result_message)
-                except Exception as e:
-                    error_message = f"Error disabling {app_type}: {str(e)}"
-                    scheduler_logger.error(error_message)
-                    add_to_history(action_entry, "error", error_message)
-                    return False
+                result_message = f"{app_type} disabled successfully"
+
+            scheduler_logger.info(message)
+            if not _update_scheduled_app_settings(
+                app_type,
+                lambda config: _set_enabled(config, False, instance_index),
+            ):
+                error_message = f"Error disabling {raw_target}"
+                scheduler_logger.error(error_message)
+                add_to_history(action_entry, "error", error_message)
+                return False
+            scheduler_logger.info(result_message)
+            add_to_history(action_entry, "success", result_message)
 
         # Handle both old "resume" and new "enable" terminology
         elif action_type == "resume" or action_type == "enable":
-            # Enable logic for global or specific app
             if app_type == "global":
                 message = "Executing global enable action"
-                scheduler_logger.info(message)
-                try:
-                    apps = ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros"]
-                    for app in apps:
-                        config_file = f"{_CONFIG_DIR}/{app}.json"
-                        if os.path.exists(config_file):
-                            with open(config_file, "r") as f:
-                                config_data = json.load(f)
-                            # Update root level enabled field
-                            config_data["enabled"] = True
-                            # Also update enabled field in instances array if it exists
-                            if "instances" in config_data and isinstance(config_data["instances"], list):
-                                for instance in config_data["instances"]:
-                                    if isinstance(instance, dict):
-                                        instance["enabled"] = True
-                            with open(config_file, "w") as f:
-                                json.dump(config_data, f, indent=2)
-                            # Clear cache for this app to ensure the UI refreshes
-                            clear_cache(app)
-                    result_message = "All apps enabled successfully"
-                    scheduler_logger.info(result_message)
-                    add_to_history(action_entry, "success", result_message)
-                except Exception as e:
-                    error_message = f"Error enabling all apps: {str(e)}"
-                    scheduler_logger.error(error_message)
-                    add_to_history(action_entry, "error", error_message)
-                    return False
+                result_message = "All apps enabled successfully"
             else:
                 message = f"Executing enable action for {app_type}"
-                scheduler_logger.info(message)
-                try:
-                    config_file = f"{_CONFIG_DIR}/{app_type}.json"
-                    if os.path.exists(config_file):
-                        with open(config_file, "r") as f:
-                            config_data = json.load(f)
-                        # Update root level enabled field
-                        config_data["enabled"] = True
-                        # Also update enabled field in instances array if it exists
-                        if "instances" in config_data and isinstance(config_data["instances"], list):
-                            for instance in config_data["instances"]:
-                                if isinstance(instance, dict):
-                                    instance["enabled"] = True
-                        with open(config_file, "w") as f:
-                            json.dump(config_data, f, indent=2)
-                        # Clear cache for this app to ensure the UI refreshes
-                        clear_cache(app_type)
-                    result_message = f"{app_type} enabled successfully"
-                    scheduler_logger.info(result_message)
-                    add_to_history(action_entry, "success", result_message)
-                except Exception as e:
-                    error_message = f"Error enabling {app_type}: {str(e)}"
-                    scheduler_logger.error(error_message)
-                    add_to_history(action_entry, "error", error_message)
-                    return False
+                result_message = f"{app_type} enabled successfully"
+
+            scheduler_logger.info(message)
+            if not _update_scheduled_app_settings(
+                app_type,
+                lambda config: _set_enabled(config, True, instance_index),
+            ):
+                error_message = f"Error enabling {raw_target}"
+                scheduler_logger.error(error_message)
+                add_to_history(action_entry, "error", error_message)
+                return False
+            scheduler_logger.info(result_message)
+            add_to_history(action_entry, "success", result_message)
 
         # Handle the API limit actions based on the predefined values
         elif action_type.startswith("api-") or action_type.startswith("API Limits "):
@@ -284,49 +478,33 @@ def execute_action(action_entry):
 
                 if app_type == "global":
                     message = f"Setting global API cap to {api_limit}"
-                    scheduler_logger.info(message)
-                    try:
-                        apps = ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros"]
-                        for app in apps:
-                            config_file = f"{_CONFIG_DIR}/{app}.json"
-                            if os.path.exists(config_file):
-                                with open(config_file, "r") as f:
-                                    config_data = json.load(f)
-                                config_data["hourly_cap"] = api_limit
-                                with open(config_file, "w") as f:
-                                    json.dump(config_data, f, indent=2)
-                        result_message = f"API cap set to {api_limit} for all apps"
-                        scheduler_logger.info(result_message)
-                        add_to_history(action_entry, "success", result_message)
-                    except Exception as e:
-                        error_message = f"Error setting global API cap to {api_limit}: {str(e)}"
-                        scheduler_logger.error(error_message)
-                        add_to_history(action_entry, "error", error_message)
-                        return False
+                    result_message = f"API cap set to {api_limit} for all apps"
                 else:
                     message = f"Setting API cap for {app_type} to {api_limit}"
-                    scheduler_logger.info(message)
-                    try:
-                        config_file = f"{_CONFIG_DIR}/{app_type}.json"
-                        if os.path.exists(config_file):
-                            with open(config_file, "r") as f:
-                                config_data = json.load(f)
-                            config_data["hourly_cap"] = api_limit
-                            with open(config_file, "w") as f:
-                                json.dump(config_data, f, indent=2)
-                        result_message = f"API cap set to {api_limit} for {app_type}"
-                        scheduler_logger.info(result_message)
-                        add_to_history(action_entry, "success", result_message)
-                    except Exception as e:
-                        error_message = f"Error setting API cap for {app_type} to {api_limit}: {str(e)}"
-                        scheduler_logger.error(error_message)
-                        add_to_history(action_entry, "error", error_message)
-                        return False
+                    result_message = f"API cap set to {api_limit} for {app_type}"
+
+                scheduler_logger.info(message)
+                if not _update_scheduled_app_settings(
+                    app_type,
+                    lambda config: _set_hourly_cap(config, api_limit),
+                ):
+                    error_message = f"Error setting API cap for {app_type} to {api_limit}"
+                    scheduler_logger.error(error_message)
+                    add_to_history(action_entry, "error", error_message)
+                    return False
+                scheduler_logger.info(result_message)
+                add_to_history(action_entry, "success", result_message)
             except ValueError:
                 error_message = f"Invalid API limit format: {action_type}"
                 scheduler_logger.error(error_message)
                 add_to_history(action_entry, "error", error_message)
                 return False
+
+        else:
+            error_message = f"Invalid scheduler action: {action_type}"
+            scheduler_logger.error(error_message)
+            add_to_history(action_entry, "error", error_message)
+            return False
 
         # Mark this action as executed for today
         last_executed_actions[execution_key] = datetime.datetime.now()
@@ -338,115 +516,73 @@ def execute_action(action_entry):
         return False
 
 
-def should_execute_schedule(schedule_entry):
-    """Check if a schedule entry should be executed now"""
+def should_execute_schedule(schedule_entry, current_time=None):
+    """Check whether the most recent scheduled occurrence is in its run window."""
+    if not isinstance(schedule_entry, dict):
+        scheduler_logger.warning("Invalid schedule entry: expected an object")
+        return False
+
+    schedule_entry.pop("_scheduled_for", None)
     schedule_id = schedule_entry.get("id", "unknown")
-
-    # Debug log the schedule we're checking
     scheduler_logger.debug(f"Checking if schedule {schedule_id} should be executed")
-
-    # Log exact system time for debugging
-    exact_time = datetime.datetime.now()
-    scheduler_logger.info(f"EXACT CURRENT TIME: {exact_time.strftime('%Y-%m-%d %H:%M:%S.%f')}")
 
     if not schedule_entry.get("enabled", True):
         scheduler_logger.debug(f"Schedule {schedule_id} is disabled, skipping")
         return False
 
-    # Check if specific days are configured
-    days = schedule_entry.get("days", [])
-    scheduler_logger.debug(f"Schedule {schedule_id} days: {days}")
+    if current_time is None:
+        current_time = datetime.datetime.now()
+    if not isinstance(current_time, datetime.datetime):
+        scheduler_logger.warning("Invalid scheduler comparison time")
+        return False
 
-    # Get today's day of week in lowercase
-    current_day = datetime.datetime.now().strftime("%A").lower()  # e.g., 'monday'
-
-    # Debug what's being compared
-    scheduler_logger.info(f"CRITICAL DEBUG - Today: '{current_day}', Schedule days: {days}")
-
-    # If days array is empty, treat as "run every day"
-    if not days:
-        scheduler_logger.debug(f"Schedule {schedule_id} has no days specified, treating as 'run every day'")
-    else:
-        # Make sure all day comparisons are done with lowercase strings
-        lowercase_days = [str(day).lower() for day in days]
-
-        # If today is not in the schedule days, skip this schedule
-        if current_day not in lowercase_days:
-            scheduler_logger.info(f"FAILURE: Schedule {schedule_id} not configured to run on {current_day}, skipping")
-            return False
-        else:
-            scheduler_logger.info(f"SUCCESS: Schedule {schedule_id} IS configured to run on {current_day}")
-
-    # Get current time with second-level precision for accurate timing
-    current_time = datetime.datetime.now()
-
-    # Extract scheduled time from different possible formats
     try:
-        # First try the flat format
         schedule_hour = schedule_entry.get("hour")
         schedule_minute = schedule_entry.get("minute")
 
-        # If not found, try nested format
         if schedule_hour is None or schedule_minute is None:
             schedule_hour = schedule_entry.get("time", {}).get("hour")
             schedule_minute = schedule_entry.get("time", {}).get("minute")
 
-        # Convert to integers to ensure proper comparison
         schedule_hour = int(schedule_hour)
         schedule_minute = int(schedule_minute)
-    except (TypeError, ValueError):
+        if not 0 <= schedule_hour <= 23 or not 0 <= schedule_minute <= 59:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
         scheduler_logger.warning(f"Invalid schedule time format in entry: {schedule_entry}")
         return False
 
-    # Add detailed logging for time debugging
-    scheduler_logger.info(
-        f"Schedule {schedule_id} time: {schedule_hour:02d}:{schedule_minute:02d}, "
-        f"current time: {current_time.hour:02d}:{current_time.minute:02d}:{current_time.second:02d}"
+    scheduled_at = current_time.replace(
+        hour=schedule_hour,
+        minute=schedule_minute,
+        second=0,
+        microsecond=0,
     )
+    if scheduled_at > current_time:
+        scheduled_at -= datetime.timedelta(days=1)
 
-    # ===== STRICT TIME COMPARISON - PREVENT EARLY EXECUTION =====
-
-    # If current hour is BEFORE scheduled hour, NEVER execute
-    if current_time.hour < schedule_hour:
-        scheduler_logger.info(
-            f"BLOCKED EXECUTION: Current hour {current_time.hour} is BEFORE scheduled hour {schedule_hour}"
+    days = schedule_entry.get("days", [])
+    scheduled_day = scheduled_at.strftime("%A").lower()
+    if days and scheduled_day not in {str(day).lower() for day in days}:
+        scheduler_logger.debug(
+            f"Schedule {schedule_id} is not configured for its most recent occurrence on {scheduled_day}"
         )
         return False
 
-    # If same hour but current minute is BEFORE scheduled minute, NEVER execute
-    if current_time.hour == schedule_hour and current_time.minute < schedule_minute:
+    elapsed = current_time - scheduled_at
+    should_execute = datetime.timedelta(0) <= elapsed < datetime.timedelta(minutes=4)
+    if should_execute:
+        schedule_entry["_scheduled_for"] = scheduled_at
         scheduler_logger.info(
-            f"BLOCKED EXECUTION: Current minute {current_time.minute} is BEFORE scheduled minute {schedule_minute}"
+            f"Schedule {schedule_id} is within its execution window "
+            f"({scheduled_at.strftime('%Y-%m-%d %H:%M')} scheduled)"
         )
-        return False
-
-    # ===== 4-MINUTE EXECUTION WINDOW =====
-
-    # We're in the scheduled hour and minute, or later - check 4-minute window
-    if current_time.hour == schedule_hour:
-        # Execute if we're in the scheduled minute or up to 3 minutes after the scheduled minute
-        if current_time.minute >= schedule_minute and current_time.minute < schedule_minute + 4:
-            scheduler_logger.info(
-                f"EXECUTING: Current time {current_time.hour:02d}:{current_time.minute:02d} is within the 4-minute window after {schedule_hour:02d}:{schedule_minute:02d}"
-            )
-            return True
-
-    # Handle hour rollover case (e.g., scheduled for 6:59, now it's 7:00, 7:01, or 7:02)
-    if current_time.hour == schedule_hour + 1:
-        # Only apply if scheduled minute was in the last 3 minutes of the hour (57-59)
-        # and current minute is in the first (60 - schedule_minute) minutes of the next hour
-        if schedule_minute >= 57 and current_time.minute < (60 - schedule_minute):
-            scheduler_logger.info(
-                f"EXECUTING: Hour rollover within 4-minute window after {schedule_hour:02d}:{schedule_minute:02d}"
-            )
-            return True
-
-    # We've missed the 4-minute window
-    scheduler_logger.info(
-        f"MISSED WINDOW: Current time {current_time.hour:02d}:{current_time.minute:02d} "
-        f"is past the 4-minute window for {schedule_hour:02d}:{schedule_minute:02d}"
-    )
-    return False
+    else:
+        scheduler_logger.debug(
+            f"Schedule {schedule_id} is outside its execution window "
+            f"({scheduled_at.strftime('%Y-%m-%d %H:%M')} scheduled)"
+        )
+    return should_execute
 
 
 def check_and_execute_schedules():
@@ -502,10 +638,13 @@ def check_and_execute_schedules():
 
                     # Execute the action
                     schedule_entry["appType"] = app_type
-                    execute_action(schedule_entry)
+                    action_succeeded = execute_action(
+                        schedule_entry,
+                        scheduled_for=schedule_entry.pop("_scheduled_for", None),
+                    )
 
                     # Update last executed time
-                    if entry_id:
+                    if entry_id and action_succeeded:
                         last_executed_actions[entry_id] = datetime.datetime.now()
 
         # No need to log anything when no schedules are found, as this is expected

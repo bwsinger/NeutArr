@@ -10,6 +10,8 @@ import sys
 import signal
 import logging  # Use standard logging for initial setup
 
+from src.primary.log_redaction import install_sensitive_data_filter
+
 # Ensure the 'src' directory is in the Python path
 # This allows importing modules from 'src.primary' etc.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
@@ -20,6 +22,7 @@ log_level = logging.DEBUG if os.environ.get("DEBUG", "false").lower() == "true" 
 logging.basicConfig(
     level=log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
+install_sensitive_data_filter()
 root_logger = logging.getLogger("NeutArrRoot")  # Specific logger for this entry point
 root_logger.info("--- NeutArr Main Process Starting ---")
 root_logger.info(f"Python sys.path: {sys.path}")
@@ -42,6 +45,7 @@ except Exception as e:
 try:
     # Import the Flask app instance
     from primary.web_server import app
+    from src.primary.auth import ensure_setup_token
 
     # Import the background task starter function and shutdown helpers from the renamed file
     from primary.background import start_neutarr, stop_event, shutdown_threads
@@ -89,6 +93,7 @@ def run_web_server():
     host = os.environ.get("FLASK_HOST", "0.0.0.0")  # nosec B104
     port = int(os.environ.get("PORT", 9705))  # Use PORT for consistency
 
+    ensure_setup_token()
     web_logger.info(f"Starting web server on {host}:{port} (Debug: {debug_mode})...")
 
     if debug_mode:

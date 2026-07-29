@@ -4,14 +4,29 @@
  */
 
 (function() {
-    document.addEventListener('DOMContentLoaded', function() {
+    document.addEventListener('DOMContentLoaded', async function() {
         if (!document.getElementById('accountSettingsPanel')) {
             return;
+        }
+
+        if (typeof AuthManager !== 'undefined') {
+            await AuthManager.bootstrap();
+            if (AuthManager.isLocalBypassActive()) {
+                showLocalBypassNotice();
+                return;
+            }
         }
 
         initAccountSettings();
         setupEventHandlers();
     });
+
+    function showLocalBypassNotice() {
+        const notice = document.getElementById('accountSettingsLocalBypassNotice');
+        const controls = document.getElementById('accountSettingsControls');
+        if (notice) notice.hidden = false;
+        if (controls) controls.hidden = true;
+    }
 
     function initAccountSettings() {
         fetchUserInfo();
@@ -35,10 +50,19 @@
                 const display = document.getElementById('apiKeyDisplay');
                 if (!display) return;
                 const isVisible = display.type === 'text';
-                display.type = isVisible ? 'password' : 'text';
-                this.innerHTML = isVisible
-                    ? '<i class="fas fa-eye"></i> Show'
-                    : '<i class="fas fa-eye-slash"></i> Hide';
+                const willShow = !isVisible;
+                const icon = this.querySelector('i');
+                const label = this.querySelector('.api-key-visibility-label');
+                display.type = willShow ? 'text' : 'password';
+                if (icon) {
+                    icon.className = willShow ? 'fas fa-eye-slash' : 'fas fa-eye';
+                }
+                if (label) {
+                    label.textContent = willShow ? 'Hide' : 'Show';
+                }
+                this.setAttribute('aria-pressed', String(willShow));
+                this.setAttribute('aria-label', willShow ? 'Hide API key' : 'Show API key');
+                this.title = willShow ? 'Hide API key' : 'Show API key';
             });
         }
 
@@ -77,10 +101,7 @@
             const data = await response.json();
 
             if (response.ok) {
-                // Server issues new tokens with the new username — store them
-                if (data.access_token && data.refresh_token) {
-                    AuthManager.setTokens(data.access_token, data.refresh_token, data.username || newUsername);
-                }
+                AuthManager.setSession(data.username || newUsername);
                 showStatus(statusElement, 'Username updated successfully', 'success');
                 updateUsernameElements(newUsername);
                 document.getElementById('newUsername').value = '';
@@ -122,7 +143,11 @@
             const data = await response.json();
 
             if (response.ok) {
-                showStatus(statusElement, 'Password updated successfully', 'success');
+                showStatus(
+                    statusElement,
+                    'Password updated successfully. Other signed-in sessions were revoked.',
+                    'success'
+                );
                 document.getElementById('currentPassword').value = '';
                 document.getElementById('newPassword').value = '';
                 document.getElementById('confirmPassword').value = '';
@@ -205,9 +230,6 @@
             if (response.ok) {
                 const display = document.getElementById('apiKeyDisplay');
                 if (display) display.value = data.api_key;
-                if (typeof AuthManager !== 'undefined' && typeof AuthManager.setApiKey === 'function') {
-                    AuthManager.setApiKey(data.api_key);
-                }
                 showStatus(statusElement, 'API key rotated — update any scripts using the old key', 'success');
             } else {
                 showStatus(statusElement, data.error || 'Failed to rotate API key', 'error');

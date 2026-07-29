@@ -305,6 +305,18 @@
                 <h2 style="margin: 0 0 20px; color: #fff; font-size: 20px; font-weight: 500;">Create Your Account</h2>
                 <div class="error-message" id="accountError"></div>
                 <div class="form-group">
+                    <label for="setup_token">
+                        <i class="fas fa-key"></i>
+                        <span>First-run setup token</span>
+                    </label>
+                    <input type="password" id="setup_token" name="setup_token" required autocomplete="off">
+                    <div class="auth-mode-description">
+                        Find the generated token in the NeutArr container logs or
+                        <code>/config/.setup-token</code>. You can instead provide
+                        <code>NEUTARR_SETUP_TOKEN</code> before first startup.
+                    </div>
+                </div>
+                <div class="form-group">
                     <label for="username">
                         <i class="fas fa-user"></i>
                         <span>Username</span>
@@ -345,14 +357,14 @@
                     <select id="auth_mode">
                         <option value="login" selected>Login Mode (recommended)</option>
                         <option value="local_bypass">Local Bypass Mode</option>
-                        <option value="no_login">No Login Mode</option>
+                        <option value="no_login">Proxy Auth Mode</option>
                     </select>
                     <div class="auth-mode-description" id="authModeDescription">
                         Standard login required for all connections.
                     </div>
                     <div class="warning-text" id="authModeWarning" style="display: none;">
                         <i class="fas fa-exclamation-triangle"></i>
-                        Only use this if your reverse proxy is properly securing access.
+                        Configure both required environment variables before relying on proxy authentication.
                     </div>
                 </div>
                 <div class="form-actions">
@@ -372,6 +384,7 @@
             const accountError = document.getElementById('accountError');
             const authModeError = document.getElementById('authModeError');
 
+            const setupTokenInput = document.getElementById('setup_token');
             const usernameInput = document.getElementById('username');
             const passwordInput = document.getElementById('password');
             const confirmPasswordInput = document.getElementById('confirm_password');
@@ -399,7 +412,7 @@
             const modeDescriptions = {
                 login: 'Standard login required for all connections.',
                 local_bypass: 'Local network connections (192.168.x.x, 10.x.x.x, 172.16.x.x) bypass authentication. Remote connections still require login.',
-                no_login: 'Authentication is completely disabled. Only use this when running behind a properly configured reverse proxy with its own auth.'
+                no_login: 'Trust authentication asserted by a configured reverse proxy. TRUSTED_PROXIES and NEUTARR_PROXY_AUTH_HEADER are required.'
             };
 
             authModeSelect.addEventListener('change', function() {
@@ -435,11 +448,12 @@
             accountNextButton.addEventListener('click', async function() {
                 hideError(accountError);
 
+                const setupToken = setupTokenInput.value.trim();
                 const username = usernameInput.value.trim();
                 const password = passwordInput.value;
                 const confirmPassword = confirmPasswordInput.value;
 
-                if (!username || !password || !confirmPassword) {
+                if (!setupToken || !username || !password || !confirmPassword) {
                     showError(accountError, 'All fields are required.');
                     return;
                 }
@@ -464,14 +478,19 @@
                     const response = await fetch('/api/auth/setup', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ username, password, confirm_password: confirmPassword }),
+                        body: JSON.stringify({
+                            setup_token: setupToken,
+                            username,
+                            password,
+                            confirm_password: confirmPassword
+                        }),
                     });
 
                     const data = await response.json();
 
                     if (response.ok) {
-                        // Store tokens — we're now authenticated
-                        AuthManager.setTokens(data.access_token, data.refresh_token, data.username);
+                        // The server set HttpOnly session cookies.
+                        AuthManager.setSession(data.username);
                         goToStep(2);
                     } else {
                         showError(accountError, data.error || 'Failed to create account.');

@@ -13,6 +13,69 @@ const SettingsForms = {
             .replace(/'/g, '&#39;');
     },
 
+    generateInstanceIdentity: function(index, name) {
+        const instanceNumber = index + 1;
+        const displayName = String(name ?? '').trim() || 'Unnamed instance';
+
+        return `
+            <div class="instance-identity">
+                <span class="instance-number" aria-label="Instance ${instanceNumber}">${String(instanceNumber).padStart(2, '0')}</span>
+                <span class="instance-name-label">Instance name</span>
+                <h4 data-instance-name>${SettingsForms.escapeHtml(displayName)}</h4>
+            </div>
+        `;
+    },
+
+    bindInstanceNameHeading: function(instanceItem) {
+        if (instanceItem.dataset.nameHeadingBound === 'true') return;
+
+        const nameInput = instanceItem.querySelector('input[name="name"]');
+        const nameHeading = instanceItem.querySelector('[data-instance-name]');
+        if (!nameInput || !nameHeading) return;
+
+        const updateHeading = () => {
+            nameHeading.textContent = nameInput.value.trim() || 'Unnamed instance';
+        };
+
+        nameInput.addEventListener('input', updateHeading);
+        instanceItem.dataset.nameHeadingBound = 'true';
+        updateHeading();
+    },
+
+    validateInstanceNames: function(container) {
+        const instanceItems = Array.from(container.querySelectorAll('.instance-item, .instance-panel'));
+        let firstInvalidInput = null;
+
+        instanceItems.forEach((instanceItem, index) => {
+            const nameInput = instanceItem.querySelector('input[name="name"]');
+            if (!nameInput) return;
+
+            nameInput.setCustomValidity('');
+            const normalizedName = nameInput.value.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+            if (normalizedName !== 'default') return;
+
+            const apiUrl = instanceItem.querySelector('input[name="api_url"]')?.value?.trim() || '';
+            const apiKey = instanceItem.querySelector('input[name="api_key"]')?.value?.trim() || '';
+            const enabled = instanceItem.querySelector('input[name="enabled"]')?.checked === true;
+            const isEmptyDisabledPlaceholder = index === 0 && !enabled && !apiUrl && !apiKey;
+
+            if (!isEmptyDisabledPlaceholder) {
+                nameInput.setCustomValidity(
+                    '“Default” is reserved for the disabled placeholder. Choose a descriptive instance name.'
+                );
+                firstInvalidInput ||= nameInput;
+            }
+        });
+
+        if (firstInvalidInput) {
+            firstInvalidInput.reportValidity();
+            firstInvalidInput.focus();
+            return false;
+        }
+
+        return true;
+    },
+
     formatLocalBypassCidrs: function(value) {
         if (Array.isArray(value)) {
             return value.join('\n');
@@ -41,7 +104,7 @@ const SettingsForms = {
                 name: "Default",
                 api_url: settings.api_url || "", // Legacy support
                 api_key: settings.api_key || "", // Legacy support
-                enabled: true
+                enabled: false
             }];
         }
 
@@ -57,7 +120,7 @@ const SettingsForms = {
             instancesHtml += `
                 <div class="instance-item" data-instance-id="${index}">
                     <div class="instance-header">
-                        <h4>Instance ${index + 1}: ${instance.name || 'Unnamed'}</h4>
+                        ${SettingsForms.generateInstanceIdentity(index, instance.name)}
                         <div class="instance-actions">
                             ${index > 0 ? '<button type="button" class="remove-instance-btn">Remove</button>' : ''}
                             <button type="button" class="test-connection-btn" data-instance="${index}" style="margin-left: 10px;">
@@ -68,23 +131,23 @@ const SettingsForms = {
                     <div class="instance-content">
                         <div class="setting-item">
                             <label for="sonarr-name-${index}"><span class="info-icon" title="A friendly label to identify this instance in the UI"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Name:</label>
-                            <input type="text" id="sonarr-name-${index}" name="name" value="${instance.name || ''}" placeholder="Friendly name for this Sonarr instance">
-                            <p class="setting-help">Friendly name for this Sonarr instance</p>
+                            <input type="text" id="sonarr-name-${index}" name="name" value="${SettingsForms.escapeHtml(instance.name || '')}" placeholder="Friendly name for this Sonarr instance">
+                            <p class="setting-help">Friendly name for this Sonarr instance. “Default” is reserved for the disabled placeholder.</p>
                         </div>
                         <div class="setting-item">
                             <label for="sonarr-url-${index}"><span class="info-icon" title="The base URL of your Sonarr instance, e.g. http://sonarr:8989"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;URL:</label>
-                            <input type="text" id="sonarr-url-${index}" name="api_url" value="${instance.api_url || ''}" placeholder="Base URL for Sonarr (e.g., http://localhost:8989)">
+                            <input type="text" id="sonarr-url-${index}" name="api_url" value="${SettingsForms.escapeHtml(instance.api_url || '')}" placeholder="Base URL for Sonarr (e.g., http://localhost:8989)">
                             <p class="setting-help">Base URL for Sonarr (e.g., http://localhost:8989)</p>
                         </div>
                         <div class="setting-item">
                             <label for="sonarr-key-${index}"><span class="info-icon" title="Found in your *arr app under Settings > General > API Key"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;API Key:</label>
-                            <input type="text" id="sonarr-key-${index}" name="api_key" value="${instance.api_key || ''}" placeholder="API key for Sonarr">
+                            <input type="text" id="sonarr-key-${index}" name="api_key" value="${SettingsForms.escapeHtml(instance.api_key || '')}" placeholder="API key for Sonarr">
                             <p class="setting-help">API key for Sonarr</p>
                         </div>
                         <div class="setting-item">
                             <label for="sonarr-enabled-${index}"><span class="info-icon" title="Toggle this instance on or off without removing it"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enabled:</label>
                             <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
-                                <input type="checkbox" id="sonarr-enabled-${index}" name="enabled" ${instance.enabled !== false ? 'checked' : ''}>
+                                <input type="checkbox" id="sonarr-enabled-${index}" name="enabled" ${instance.enabled === true ? 'checked' : ''}>
                                 <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                             </label>
                         </div>
@@ -210,7 +273,7 @@ const SettingsForms = {
                 name: "Default",
                 api_url: settings.api_url || "",
                 api_key: settings.api_key || "",
-                enabled: true
+                enabled: false
             }];
         }
         
@@ -234,7 +297,7 @@ const SettingsForms = {
             instancesHtml += `
                 <div class="instance-item" data-instance-id="${index}">
                     <div class="instance-header">
-                        <h4>Instance ${index + 1}: ${instance.name || 'Unnamed'}</h4>
+                        ${SettingsForms.generateInstanceIdentity(index, instance.name)}
                         <div class="instance-actions">
                             ${index > 0 ? '<button type="button" class="remove-instance-btn">Remove</button>' : ''}
                             <button type="button" class="test-connection-btn" data-instance="${index}" style="margin-left: 10px;">
@@ -245,23 +308,23 @@ const SettingsForms = {
                     <div class="instance-content">
                         <div class="setting-item">
                             <label for="radarr-name-${index}"><span class="info-icon" title="A friendly label to identify this instance in the UI"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Name:</label>
-                            <input type="text" id="radarr-name-${index}" name="name" value="${instance.name || ''}" placeholder="Friendly name for this Radarr instance">
-                            <p class="setting-help">Friendly name for this Radarr instance</p>
+                            <input type="text" id="radarr-name-${index}" name="name" value="${SettingsForms.escapeHtml(instance.name || '')}" placeholder="Friendly name for this Radarr instance">
+                            <p class="setting-help">Friendly name for this Radarr instance. “Default” is reserved for the disabled placeholder.</p>
                         </div>
                         <div class="setting-item">
                             <label for="radarr-url-${index}"><span class="info-icon" title="The base URL of your Radarr instance, e.g. http://radarr:7878"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;URL:</label>
-                            <input type="text" id="radarr-url-${index}" name="api_url" value="${instance.api_url || ''}" placeholder="Base URL for Radarr (e.g., http://localhost:7878)">
+                            <input type="text" id="radarr-url-${index}" name="api_url" value="${SettingsForms.escapeHtml(instance.api_url || '')}" placeholder="Base URL for Radarr (e.g., http://localhost:7878)">
                             <p class="setting-help">Base URL for Radarr (e.g., http://localhost:7878)</p>
                         </div>
                         <div class="setting-item">
                             <label for="radarr-key-${index}"><span class="info-icon" title="Found in your *arr app under Settings > General > API Key"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;API Key:</label>
-                            <input type="text" id="radarr-key-${index}" name="api_key" value="${instance.api_key || ''}" placeholder="API key for Radarr">
+                            <input type="text" id="radarr-key-${index}" name="api_key" value="${SettingsForms.escapeHtml(instance.api_key || '')}" placeholder="API key for Radarr">
                             <p class="setting-help">API key for Radarr</p>
                         </div>
                         <div class="setting-item">
                             <label for="radarr-enabled-${index}"><span class="info-icon" title="Toggle this instance on or off without removing it"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enabled:</label>
                             <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
-                                <input type="checkbox" id="radarr-enabled-${index}" name="enabled" ${instance.enabled !== false ? 'checked' : ''}>
+                                <input type="checkbox" id="radarr-enabled-${index}" name="enabled" ${instance.enabled === true ? 'checked' : ''}>
                                 <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                             </label>
                         </div>
@@ -369,7 +432,7 @@ const SettingsForms = {
                 name: "Default",
                 api_url: settings.api_url || "", // Legacy support
                 api_key: settings.api_key || "", // Legacy support
-                enabled: true
+                enabled: false
             }];
         }
         
@@ -385,7 +448,7 @@ const SettingsForms = {
             instancesHtml += `
                 <div class="instance-item" data-instance-id="${index}">
                     <div class="instance-header">
-                        <h4>Instance ${index + 1}: ${instance.name || 'Unnamed'}</h4>
+                        ${SettingsForms.generateInstanceIdentity(index, instance.name)}
                         <div class="instance-actions">
                             ${index > 0 ? '<button type="button" class="remove-instance-btn">Remove</button>' : ''}
                             <button type="button" class="test-connection-btn" data-instance="${index}" style="margin-left: 10px;">
@@ -396,23 +459,23 @@ const SettingsForms = {
                     <div class="instance-content">
                         <div class="setting-item">
                             <label for="lidarr-name-${index}"><span class="info-icon" title="A friendly label to identify this instance in the UI"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Name:</label>
-                            <input type="text" id="lidarr-name-${index}" name="name" value="${instance.name || ''}" placeholder="Friendly name for this Lidarr instance">
-                            <p class="setting-help">Friendly name for this Lidarr instance</p>
+                            <input type="text" id="lidarr-name-${index}" name="name" value="${SettingsForms.escapeHtml(instance.name || '')}" placeholder="Friendly name for this Lidarr instance">
+                            <p class="setting-help">Friendly name for this Lidarr instance. “Default” is reserved for the disabled placeholder.</p>
                         </div>
                         <div class="setting-item">
                             <label for="lidarr-url-${index}"><span class="info-icon" title="The base URL of your Lidarr instance, e.g. http://lidarr:8686"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;URL:</label>
-                            <input type="text" id="lidarr-url-${index}" name="api_url" value="${instance.api_url || ''}" placeholder="Base URL for Lidarr (e.g., http://localhost:8686)">
+                            <input type="text" id="lidarr-url-${index}" name="api_url" value="${SettingsForms.escapeHtml(instance.api_url || '')}" placeholder="Base URL for Lidarr (e.g., http://localhost:8686)">
                             <p class="setting-help">Base URL for Lidarr (e.g., http://localhost:8686)</p>
                         </div>
                         <div class="setting-item">
                             <label for="lidarr-key-${index}"><span class="info-icon" title="Found in your *arr app under Settings > General > API Key"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;API Key:</label>
-                            <input type="text" id="lidarr-key-${index}" name="api_key" value="${instance.api_key || ''}" placeholder="API key for Lidarr">
+                            <input type="text" id="lidarr-key-${index}" name="api_key" value="${SettingsForms.escapeHtml(instance.api_key || '')}" placeholder="API key for Lidarr">
                             <p class="setting-help">API key for Lidarr</p>
                         </div>
                         <div class="setting-item">
                             <label for="lidarr-enabled-${index}"><span class="info-icon" title="Toggle this instance on or off without removing it"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enabled:</label>
                             <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
-                                <input type="checkbox" id="lidarr-enabled-${index}" name="enabled" ${instance.enabled !== false ? 'checked' : ''}>
+                                <input type="checkbox" id="lidarr-enabled-${index}" name="enabled" ${instance.enabled === true ? 'checked' : ''}>
                                 <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                             </label>
                         </div>
@@ -505,7 +568,7 @@ const SettingsForms = {
                 name: "Default",
                 api_url: settings.api_url || "", // Legacy support
                 api_key: settings.api_key || "", // Legacy support
-                enabled: true
+                enabled: false
             }];
         }
         
@@ -521,7 +584,7 @@ const SettingsForms = {
             instancesHtml += `
                 <div class="instance-item" data-instance-id="${index}">
                     <div class="instance-header">
-                        <h4>Instance ${index + 1}: ${instance.name || 'Unnamed'}</h4>
+                        ${SettingsForms.generateInstanceIdentity(index, instance.name)}
                         <div class="instance-actions">
                             ${index > 0 ? '<button type="button" class="remove-instance-btn">Remove</button>' : ''}
                             <button type="button" class="test-connection-btn" data-instance="${index}" style="margin-left: 10px;">
@@ -532,23 +595,23 @@ const SettingsForms = {
                     <div class="instance-content">
                         <div class="setting-item">
                             <label for="readarr-name-${index}"><span class="info-icon" title="A friendly label to identify this instance in the UI"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Name:</label>
-                            <input type="text" id="readarr-name-${index}" name="name" value="${instance.name || ''}" placeholder="Friendly name for this Readarr instance">
-                            <p class="setting-help">Friendly name for this Readarr instance</p>
+                            <input type="text" id="readarr-name-${index}" name="name" value="${SettingsForms.escapeHtml(instance.name || '')}" placeholder="Friendly name for this Readarr instance">
+                            <p class="setting-help">Friendly name for this Readarr instance. “Default” is reserved for the disabled placeholder.</p>
                         </div>
                         <div class="setting-item">
                             <label for="readarr-url-${index}"><span class="info-icon" title="The base URL of your Readarr instance, e.g. http://readarr:8787"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;URL:</label>
-                            <input type="text" id="readarr-url-${index}" name="api_url" value="${instance.api_url || ''}" placeholder="Base URL for Readarr (e.g., http://localhost:8787)">
+                            <input type="text" id="readarr-url-${index}" name="api_url" value="${SettingsForms.escapeHtml(instance.api_url || '')}" placeholder="Base URL for Readarr (e.g., http://localhost:8787)">
                             <p class="setting-help">Base URL for Readarr (e.g., http://localhost:8787)</p>
                         </div>
                         <div class="setting-item">
                             <label for="readarr-key-${index}"><span class="info-icon" title="Found in your *arr app under Settings > General > API Key"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;API Key:</label>
-                            <input type="text" id="readarr-key-${index}" name="api_key" value="${instance.api_key || ''}" placeholder="API key for Readarr">
+                            <input type="text" id="readarr-key-${index}" name="api_key" value="${SettingsForms.escapeHtml(instance.api_key || '')}" placeholder="API key for Readarr">
                             <p class="setting-help">API key for Readarr</p>
                         </div>
                         <div class="setting-item">
                             <label for="readarr-enabled-${index}"><span class="info-icon" title="Toggle this instance on or off without removing it"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enabled:</label>
                             <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
-                                <input type="checkbox" id="readarr-enabled-${index}" name="enabled" ${instance.enabled !== false ? 'checked' : ''}>
+                                <input type="checkbox" id="readarr-enabled-${index}" name="enabled" ${instance.enabled === true ? 'checked' : ''}>
                                 <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                             </label>
                         </div>
@@ -632,7 +695,7 @@ const SettingsForms = {
                 name: "Default",
                 api_url: "",
                 api_key: "",
-                enabled: true
+                enabled: false
             }];
         }
 
@@ -648,7 +711,7 @@ const SettingsForms = {
             instancesHtml += `
                 <div class="instance-item" data-instance-id="${index}">
                     <div class="instance-header">
-                        <h4>Instance ${index + 1}: ${instance.name || 'Unnamed'}</h4>
+                        ${SettingsForms.generateInstanceIdentity(index, instance.name)}
                         <div class="instance-actions">
                             ${index > 0 ? '<button type="button" class="remove-instance-btn">Remove</button>' : ''}
                             <button type="button" class="test-connection-btn" data-instance="${index}" style="margin-left: 10px;">
@@ -659,23 +722,23 @@ const SettingsForms = {
                     <div class="instance-content">
                         <div class="setting-item">
                             <label for="whisparr-name-${index}"><span class="info-icon" title="A friendly label to identify this instance in the UI"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Name:</label>
-                            <input type="text" id="whisparr-name-${index}" name="name" value="${instance.name || ''}" placeholder="Friendly name for this Whisparr V2 instance">
-                            <p class="setting-help">Friendly name for this Whisparr V2 instance</p>
+                            <input type="text" id="whisparr-name-${index}" name="name" value="${SettingsForms.escapeHtml(instance.name || '')}" placeholder="Friendly name for this Whisparr V2 instance">
+                            <p class="setting-help">Friendly name for this Whisparr V2 instance. “Default” is reserved for the disabled placeholder.</p>
                         </div>
                         <div class="setting-item">
                             <label for="whisparr-url-${index}"><span class="info-icon" title="The base URL of your Whisparr instance, e.g. http://whisparr:6969"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;URL:</label>
-                            <input type="text" id="whisparr-url-${index}" name="api_url" value="${instance.api_url || ''}" placeholder="Base URL for Whisparr V2 (e.g., http://localhost:6969)">
+                            <input type="text" id="whisparr-url-${index}" name="api_url" value="${SettingsForms.escapeHtml(instance.api_url || '')}" placeholder="Base URL for Whisparr V2 (e.g., http://localhost:6969)">
                             <p class="setting-help">Base URL for Whisparr V2 (e.g., http://localhost:6969)</p>
                         </div>
                         <div class="setting-item">
                             <label for="whisparr-key-${index}"><span class="info-icon" title="Found in your *arr app under Settings > General > API Key"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;API Key:</label>
-                            <input type="text" id="whisparr-key-${index}" name="api_key" value="${instance.api_key || ''}" placeholder="API key for Whisparr V2">
+                            <input type="text" id="whisparr-key-${index}" name="api_key" value="${SettingsForms.escapeHtml(instance.api_key || '')}" placeholder="API key for Whisparr V2">
                             <p class="setting-help">API key for Whisparr V2</p>
                         </div>
                         <div class="setting-item">
                             <label for="whisparr-enabled-${index}"><span class="info-icon" title="Toggle this instance on or off without removing it"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enabled:</label>
                             <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
-                                <input type="checkbox" id="whisparr-enabled-${index}" name="enabled" ${instance.enabled !== false ? 'checked' : ''}>
+                                <input type="checkbox" id="whisparr-enabled-${index}" name="enabled" ${instance.enabled === true ? 'checked' : ''}>
                                 <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                             </label>
                         </div>
@@ -763,7 +826,7 @@ const SettingsForms = {
                 name: "Default",
                 api_url: "",
                 api_key: "",
-                enabled: true
+                enabled: false
             }];
         }
 
@@ -779,7 +842,7 @@ const SettingsForms = {
             instancesHtml += `
                 <div class="instance-item" data-instance-id="${index}">
                     <div class="instance-header">
-                        <h4>Instance ${index + 1}: ${instance.name || 'Unnamed'}</h4>
+                        ${SettingsForms.generateInstanceIdentity(index, instance.name)}
                         <div class="instance-actions">
                             ${index > 0 ? '<button type="button" class="remove-instance-btn">Remove</button>' : ''}
                             <button type="button" class="test-connection-btn" data-instance="${index}" style="margin-left: 10px;">
@@ -790,23 +853,23 @@ const SettingsForms = {
                     <div class="instance-content">
                         <div class="setting-item">
                             <label for="eros-name-${index}"><span class="info-icon" title="A friendly label to identify this instance in the UI"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Name:</label>
-                            <input type="text" id="eros-name-${index}" name="name" value="${instance.name || ''}" placeholder="Friendly name for this Whisparr V3 instance">
-                            <p class="setting-help">Friendly name for this Whisparr V3 instance</p>
+                            <input type="text" id="eros-name-${index}" name="name" value="${SettingsForms.escapeHtml(instance.name || '')}" placeholder="Friendly name for this Whisparr V3 instance">
+                            <p class="setting-help">Friendly name for this Whisparr V3 instance. “Default” is reserved for the disabled placeholder.</p>
                         </div>
                         <div class="setting-item">
                             <label for="eros-url-${index}"><span class="info-icon" title="The base URL of your Whisparr V3 instance, e.g. http://whisparr:6969"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;URL:</label>
-                            <input type="text" id="eros-url-${index}" name="api_url" value="${instance.api_url || ''}" placeholder="Base URL for Whisparr V3 (e.g., http://localhost:6969)">
+                            <input type="text" id="eros-url-${index}" name="api_url" value="${SettingsForms.escapeHtml(instance.api_url || '')}" placeholder="Base URL for Whisparr V3 (e.g., http://localhost:6969)">
                             <p class="setting-help">Base URL for Whisparr V3 (e.g., http://localhost:6969)</p>
                         </div>
                         <div class="setting-item">
                             <label for="eros-key-${index}"><span class="info-icon" title="Found in your *arr app under Settings > General > API Key"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;API Key:</label>
-                            <input type="text" id="eros-key-${index}" name="api_key" value="${instance.api_key || ''}" placeholder="API key for Whisparr V3">
+                            <input type="text" id="eros-key-${index}" name="api_key" value="${SettingsForms.escapeHtml(instance.api_key || '')}" placeholder="API key for Whisparr V3">
                             <p class="setting-help">API key for Whisparr V3</p>
                         </div>
                         <div class="setting-item">
                             <label for="eros-enabled-${index}"><span class="info-icon" title="Toggle this instance on or off without removing it"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enabled:</label>
                             <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
-                                <input type="checkbox" id="eros-enabled-${index}" name="enabled" ${instance.enabled !== false ? 'checked' : ''}>
+                                <input type="checkbox" id="eros-enabled-${index}" name="enabled" ${instance.enabled === true ? 'checked' : ''}>
                                 <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                             </label>
                         </div>
@@ -901,10 +964,9 @@ const SettingsForms = {
             ['radarr', 'Radarr'],
             ['lidarr', 'Lidarr'],
             ['readarr', 'Readarr'],
-            ['whisparr', 'Whisparr'],
-            ['eros', 'Eros']
+            ['whisparr', 'Whisparr V2'],
+            ['eros', 'Whisparr V3']
         ];
-        const appEnabled = settings.app_enabled && typeof settings.app_enabled === 'object' ? settings.app_enabled : {};
         const appInstances = settings.app_instances && typeof settings.app_instances === 'object' ? settings.app_instances : {};
         const sourceSettings = allSettings || window.neutarrUI?.originalSettings || {};
         const escapeHtml = window.NeutArrUtils?.escapeHtml || function(value) {
@@ -918,26 +980,31 @@ const SettingsForms = {
         };
         const escapeAttr = escapeHtml;
 
-        const getConfiguredInstances = (app) => {
+        const getEnabledInstances = (app) => {
             const appForm = document.getElementById(`${app}Settings`);
             if (appForm) {
                 const formInstances = Array.from(appForm.querySelectorAll('.instance-item, .instance-panel'))
                     .map((instance, index) => {
                         const name = instance.querySelector('input[name="name"]')?.value?.trim();
-                        return { name: name || `Instance ${index + 1}` };
+                        const enabled = instance.querySelector('input[name="enabled"]')?.checked === true;
+                        return { name: name || `Instance ${index + 1}`, enabled };
                     });
-                if (formInstances.length > 0) return formInstances;
+                if (formInstances.length > 0) {
+                    return formInstances.filter(instance => instance.enabled === true);
+                }
             }
 
             if (Array.isArray(sourceSettings[app]?.instances) && sourceSettings[app].instances.length > 0) {
-                return sourceSettings[app].instances;
+                return sourceSettings[app].instances.filter(instance => instance?.enabled === true);
             }
 
-            return [{ name: 'Default' }];
+            return [];
         };
 
-        const instanceToggleHtml = swaparrApps.map(([app, label]) => {
-            const instances = getConfiguredInstances(app);
+        const instanceToggleGroups = swaparrApps.map(([app, label]) => {
+            const instances = getEnabledInstances(app);
+            if (instances.length === 0) return '';
+
             const instanceToggles = appInstances[app] && typeof appInstances[app] === 'object' ? appInstances[app] : {};
             const rows = instances.map((instance, index) => {
                 const instanceName = instance.name || `Instance ${index + 1}`;
@@ -949,19 +1016,26 @@ const SettingsForms = {
             }).join('');
 
             return `
-                        <div class="swaparr-app-instance-group">
-                            <strong>${label}</strong>
+                        <fieldset class="swaparr-app-instance-group">
+                            <legend>${label}</legend>
                             <div class="checkbox-group">
                                 ${rows}
                             </div>
+                        </fieldset>
+            `;
+        }).filter(Boolean);
+        const instanceToggleHtml = instanceToggleGroups.length > 0
+            ? instanceToggleGroups.join('')
+            : `
+                        <div class="swaparr-instances-empty" role="status">
+                            No app instances are enabled. Enable and configure an instance in its app settings to make it available to Swaparr.
                         </div>
             `;
-        }).join('');
         
         container.innerHTML = `
             <div class="settings-group">
                 <h3>Swaparr (Beta) - Only For Torrent Users</h3>
-                <div class="setting-item">
+                <div class="swaparr-intro">
                     <p>Swaparr addresses the issue of stalled downloads. Visit Swaparr's <a href="https://github.com/ThijmenGThN/swaparr" target="_blank">GitHub</a> for more information and support the developer!</p>
                 </div>
             </div>
@@ -981,7 +1055,7 @@ const SettingsForms = {
                     <div id="swaparr_app_instances">
                         ${instanceToggleHtml}
                     </div>
-                    <p class="setting-help">Disable Swaparr for individual instances where stalled downloads should be left alone.</p>
+                    <p class="setting-help">Only enabled app instances appear here. Uncheck an instance if Swaparr should leave its stalled downloads alone.</p>
                 </div>
                 <div class="setting-item">
                     <label for="swaparr_max_strikes"><span class="info-icon" title="Number of strikes before a stalled download is removed"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Maximum Strikes:</label>
@@ -990,12 +1064,12 @@ const SettingsForms = {
                 </div>
                 <div class="setting-item">
                     <label for="swaparr_max_download_time"><span class="info-icon" title="Maximum time in minutes before a download is considered stalled"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Max Download Time:</label>
-                    <input type="text" id="swaparr_max_download_time" value="${settings.max_download_time || '2h'}">
+                    <input type="text" id="swaparr_max_download_time" value="${SettingsForms.escapeHtml(settings.max_download_time || '2h')}">
                     <p class="setting-help">Maximum time a download can be stalled (e.g., 30m, 2h, 1d)</p>
                 </div>
                 <div class="setting-item">
                     <label for="swaparr_ignore_above_size"><span class="info-icon" title="Skip downloads larger than this size (in GB)"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Ignore Above Size:</label>
-                    <input type="text" id="swaparr_ignore_above_size" value="${settings.ignore_above_size || '25GB'}">
+                    <input type="text" id="swaparr_ignore_above_size" value="${SettingsForms.escapeHtml(settings.ignore_above_size || '25GB')}">
                     <p class="setting-help">Ignore files larger than this size (e.g., 1GB, 25GB, 1TB)</p>
                 </div>
                 <div class="setting-item">
@@ -1243,7 +1317,7 @@ const SettingsForms = {
                 const name = nameInput ? nameInput.value : null;
                 const url = urlInput ? urlInput.value : null;
                 const key = keyInput ? keyInput.value : null;
-                const enabled = enabledInput ? enabledInput.checked : true; // Default to enabled if checkbox not found
+                const enabled = enabledInput ? enabledInput.checked : false;
                 
                 if (!name || !url || !key) {
                     console.warn(`Instance ${index} is missing required fields`);
@@ -1266,7 +1340,7 @@ const SettingsForms = {
                     name: 'Default',
                     api_url: '',
                     api_key: '',
-                    enabled: true
+                    enabled: false
                 });
             }
             
@@ -1376,29 +1450,65 @@ const SettingsForms = {
         // Add data-app-type attribute to container
         container.setAttribute('data-app-type', 'general');
         const localBypassCidrs = SettingsForms.escapeHtml(SettingsForms.formatLocalBypassCidrs(settings.local_bypass_cidrs));
+        const appearance = window.NeutArrAppearance?.get() || {
+            theme: 'midnight',
+            density: 'comfortable'
+        };
+        const appearanceThemes = window.NeutArrAppearance?.themes || {
+            midnight: { label: 'Midnight Indigo' }
+        };
+        const appearanceThemeOptions = Object.entries(appearanceThemes)
+            .map(([value, theme]) => {
+                const selected = appearance.theme === value ? ' selected' : '';
+                return `<option value="${SettingsForms.escapeHtml(value)}"${selected}>${SettingsForms.escapeHtml(theme.label)}</option>`;
+            })
+            .join('');
         
         container.innerHTML = `
-            <div class="settings-group">
-                <h3>System Settings</h3>
+            <div class="settings-group appearance-settings">
+                <h3>Appearance</h3>
+                <p class="appearance-intro">Personalize this browser's NeutArr interface. Appearance changes apply immediately and save automatically on this device.</p>
                 <div class="setting-item">
+                    <label for="interface_theme"><span class="info-icon" title="Choose a color palette for the NeutArr interface"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Interface Theme:</label>
+                    <select id="interface_theme" data-local-preference="true">
+                        ${appearanceThemeOptions}
+                    </select>
+                    <p class="setting-help">Changes the interface palette without affecting other users or browsers.</p>
+                </div>
+                <div class="setting-item">
+                    <label for="interface_density"><span class="info-icon" title="Choose how much spacing is used throughout the interface"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Layout Density:</label>
+                    <select id="interface_density" data-local-preference="true">
+                        <option value="comfortable" ${appearance.density === 'comfortable' ? 'selected' : ''}>Comfortable</option>
+                        <option value="compact" ${appearance.density === 'compact' ? 'selected' : ''}>Compact</option>
+                    </select>
+                    <p class="setting-help">Compact mode reduces navigation, card, and form spacing.</p>
+                </div>
+                <div id="appearance_status" class="appearance-status" role="status" aria-live="polite">
+                    Appearance preferences are saved in this browser.
+                </div>
+            </div>
+
+            <div class="settings-group system-settings">
+                <h3>System Settings</h3>
+                <div class="setting-item toggle-setting-item">
                     <label for="check_for_updates"><span class="info-icon" title="Periodically check for new versions (informational only)"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Check for Updates:</label>
                     <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
                         <input type="checkbox" id="check_for_updates" ${settings.check_for_updates !== false ? 'checked' : ''}>
                         <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                     </label>
-                    <p class="setting-help" style="margin-left: -3ch !important;">Automatically check for NeutArr updates</p>
+                    <p class="setting-help">Automatically check for NeutArr updates</p>
                 </div>
-                <div class="setting-item">
+                <div class="setting-item toggle-setting-item">
                     <label for="debug_mode"><span class="info-icon" title="Enable verbose logging for troubleshooting"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Debug Mode:</label>
                     <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
                         <input type="checkbox" id="debug_mode" ${settings.debug_mode === true ? 'checked' : ''}>
                         <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                     </label>
-                    <p class="setting-help" style="margin-left: -3ch !important;">Enable verbose logging for troubleshooting (applies to all apps)</p>
+                    <p class="setting-help">Enable verbose logging for troubleshooting (applies to all apps)</p>
                 </div>
             </div>
             
-            <div class="settings-group">
+            <div class="settings-group stateful-settings">
                 <div class="stateful-header-row">
                     <h3>Stateful Management</h3>
                     <!-- Original reset button removed, now using emergency button -->
@@ -1421,8 +1531,8 @@ const SettingsForms = {
                 <div class="setting-item">
                     <label for="stateful_management_hours"><span class="info-icon" title="Hours before search state resets, allowing items to be re-searched"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;State Reset (Hours):</label>
                     <input type="number" id="stateful_management_hours" min="1" value="${settings.stateful_management_hours || 168}" style="width: 50% !important; max-width: 200px !important; box-sizing: border-box !important; margin: 0 !important; padding: 8px 12px !important; border-radius: 4px !important; display: block !important; text-align: left !important;">
-                    <p class="setting-help" style="margin-left: -3ch !important;">Hours before resetting processed media state (<span id="stateful_management_days">${((settings.stateful_management_hours || 168) / 24).toFixed(1)} days</span>)</p>
-                    <p class="setting-help reset-help" style="margin-left: -3ch !important;">Reset clears all processed media IDs to allow reprocessing</p>
+                    <p class="setting-help">Hours before resetting processed media state (<span id="stateful_management_days">${((settings.stateful_management_hours || 168) / 24).toFixed(1)} days</span>)</p>
+                    <p class="setting-help reset-help">Reset clears all processed media IDs to allow reprocessing</p>
                 </div>
             </div>
             
@@ -1433,28 +1543,28 @@ const SettingsForms = {
                     <select id="auth_mode" name="auth_mode" style="width: 300px; padding: 8px 12px; border-radius: 6px; cursor: pointer; border: 1px solid rgba(255, 255, 255, 0.1); background-color: #1f2937; color: #d1d5db; background-image: url('data:image/svg+xml;utf8,<svg fill=\'white\' height=\'24\' viewBox=\'0 0 24 24\' width=\'24\' xmlns=\'http://www.w3.org/2000/svg\'><path d=\'M7 10l5 5 5-5z\'/><path d=\'M0 0h24v24H0z\' fill=\'none\'/></svg>'); background-repeat: no-repeat; background-position: right 8px center; -webkit-appearance: none; -moz-appearance: none; appearance: none;">
                         <option value="login" ${(settings.auth_mode === 'login' || (!settings.auth_mode && !settings.local_access_bypass && !settings.proxy_auth_bypass)) ? 'selected' : ''}>Login Mode</option>
                         <option value="local_bypass" ${(settings.auth_mode === 'local_bypass' || (!settings.auth_mode && settings.local_access_bypass === true && !settings.proxy_auth_bypass)) ? 'selected' : ''}>Local Bypass Mode</option>
-                        <option value="no_login" ${(settings.auth_mode === 'no_login' || (!settings.auth_mode && settings.proxy_auth_bypass === true)) ? 'selected' : ''}>No Login Mode</option>
+                        <option value="no_login" ${(settings.auth_mode === 'no_login' || (!settings.auth_mode && settings.proxy_auth_bypass === true)) ? 'selected' : ''}>Proxy Auth Mode</option>
                     </select>
-                    <p class="setting-help" style="margin-left: -3ch !important;">
+                    <p class="setting-help">
                         <strong>Login Mode:</strong> Standard login required for all connections<br>
                         <strong>Local Bypass Mode:</strong> Connections from the CIDR ranges below bypass login<br>
-                        <strong>No Login Mode:</strong> Completely disable authentication when running behind your own reverse proxy
+                        <strong>Proxy Auth Mode:</strong> Trust an identity header only from reverse proxies listed in <code>TRUSTED_PROXIES</code>
                     </p>
-                    <p class="setting-help warning" style="color: #ff6b6b; margin-left: -3ch !important;"><strong>Warning:</strong> Only use No Login Mode if your reverse proxy (e.g., Cloudflare, Nginx) is properly securing access!</p>
+                    <p id="proxy_auth_requirements" class="setting-help warning" style="color: #ff6b6b; display: ${(settings.auth_mode === 'no_login' || (!settings.auth_mode && settings.proxy_auth_bypass === true)) ? 'block' : 'none'};"><strong>Required for Proxy Auth Mode:</strong> Set <code>NEUTARR_PROXY_AUTH_HEADER</code>, configure <code>TRUSTED_PROXIES</code>, and make the proxy strip client-supplied copies of that header before setting it after authentication.</p>
                 </div>
                 <div class="setting-item" id="local_bypass_cidrs_container">
                     <label for="local_bypass_cidrs"><span class="info-icon" title="CIDR ranges allowed to skip the web login when Local Bypass Mode is selected"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Local Bypass CIDRs:</label>
                     <textarea id="local_bypass_cidrs" name="local_bypass_cidrs" rows="6" style="width: 50% !important; max-width: 460px !important; box-sizing: border-box !important; margin: 0 !important; padding: 8px 12px !important; border-radius: 4px !important; display: block !important; text-align: left !important; font-family: monospace;">${localBypassCidrs}</textarea>
-                    <p class="setting-help" style="margin-left: -3ch !important;">One CIDR range per line, or comma-separated. These ranges are only used by Local Bypass Mode.</p>
-                    <p class="setting-help warning" style="color: #ffb86c; margin-left: -3ch !important;">Use the narrowest trusted proxy or LAN ranges that should skip NeutArr login.</p>
+                    <p class="setting-help">One CIDR range per line, or comma-separated. These ranges are only used by Local Bypass Mode.</p>
+                    <p class="setting-help warning" style="color: #ffb86c;">Use the narrowest trusted proxy or LAN ranges that should skip NeutArr login.</p>
                 </div>
-                <div class="setting-item">
+                <div class="setting-item toggle-setting-item">
                     <label for="ssl_verify"><span class="info-icon" title="Verify SSL certificates when connecting to *arr instances"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enable SSL Verify:</label>
                     <label class="toggle-switch" style="width:40px; height:20px; display:inline-block; position:relative;">
                         <input type="checkbox" id="ssl_verify" ${settings.ssl_verify === true ? 'checked' : ''}>
                         <span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#3d4353; border-radius:20px; transition:0.4s;"></span>
                     </label>
-                    <p class="setting-help" style="margin-left: -3ch !important;">Disable SSL certificate verification when using self-signed certificates in private networks.</p>
+                    <p class="setting-help">Disable SSL certificate verification when using self-signed certificates in private networks.</p>
                 </div>
             </div>
             
@@ -1463,30 +1573,48 @@ const SettingsForms = {
                 <div class="setting-item">
                     <label for="api_timeout"><span class="info-icon" title="Seconds to wait for API responses before timing out"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;API Timeout:</label>
                     <input type="number" id="api_timeout" min="10" value="${settings.api_timeout !== undefined ? settings.api_timeout : 120}">
-                    <p class="setting-help" style="margin-left: -3ch !important;">API request timeout in seconds</p>
+                    <p class="setting-help">API request timeout in seconds</p>
                 </div>
                 <div class="setting-item">
                     <label for="command_wait_delay"><span class="info-icon" title="Seconds to wait between checking if a command completed"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Command Wait Delay:</label>
                     <input type="number" id="command_wait_delay" min="1" value="${settings.command_wait_delay !== undefined ? settings.command_wait_delay : 1}">
-                    <p class="setting-help" style="margin-left: -3ch !important;">Delay between command status checks in seconds</p>
+                    <p class="setting-help">Delay between command status checks in seconds</p>
                 </div>
                 <div class="setting-item">
                     <label for="command_wait_attempts"><span class="info-icon" title="Number of times to check if a command completed before giving up"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;CMD Wait Attempts:</label>
                     <input type="number" id="command_wait_attempts" min="1" value="${settings.command_wait_attempts !== undefined ? settings.command_wait_attempts : 600}">
-                    <p class="setting-help" style="margin-left: -3ch !important;">Maximum number of attempts to check command status</p>
+                    <p class="setting-help">Maximum number of attempts to check command status</p>
                 </div>
                 <div class="setting-item">
                     <label for="minimum_download_queue_size"><span class="info-icon" title="Skip searching when download queue exceeds this size"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Max DL Queue Size:</label>
                     <input type="number" id="minimum_download_queue_size" min="-1" value="${settings.minimum_download_queue_size !== undefined ? settings.minimum_download_queue_size : -1}">
-                    <p class="setting-help" style="margin-left: -3ch !important;">If the current download queue for an app instance exceeds this value, downloads will be skipped until the queue reduces. Set to -1 to disable this limit.</span>
+                    <p class="setting-help">If the current download queue for an app instance exceeds this value, downloads will be skipped until the queue reduces. Set to -1 to disable this limit.</p>
                 </div>
                 <div class="setting-item">
                     <label for="log_refresh_interval_seconds"><span class="info-icon" title="Seconds between log display refreshes in the UI"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Log Refresh Interval:</label>
                     <input type="number" id="log_refresh_interval_seconds" min="5" value="${settings.log_refresh_interval_seconds !== undefined ? settings.log_refresh_interval_seconds : 30}">
-                    <p class="setting-help" style="margin-left: -3ch !important;">How often NeutArr refreshes logs from apps (seconds)</p>
+                    <p class="setting-help">How often NeutArr refreshes logs from apps (seconds)</p>
                 </div>
             </div>
         `;
+
+        const themeSelect = container.querySelector('#interface_theme');
+        const densitySelect = container.querySelector('#interface_density');
+        const appearanceStatus = container.querySelector('#appearance_status');
+        const updateAppearance = () => {
+            if (!themeSelect || !densitySelect || !window.NeutArrAppearance) return;
+
+            const selected = window.NeutArrAppearance.apply(
+                themeSelect.value,
+                densitySelect.value
+            );
+            const themeLabel = window.NeutArrAppearance.themes[selected.theme].label;
+            if (appearanceStatus) {
+                appearanceStatus.textContent = `${themeLabel} with ${selected.density} spacing is active.`;
+            }
+        };
+        themeSelect?.addEventListener('change', updateAppearance);
+        densitySelect?.addEventListener('change', updateAppearance);
         
         // Get hours input and days span elements once
         const statefulHoursInput = container.querySelector('#stateful_management_hours');
@@ -1502,13 +1630,19 @@ const SettingsForms = {
 
         const authModeSelect = container.querySelector('#auth_mode');
         const localBypassCidrsContainer = container.querySelector('#local_bypass_cidrs_container');
-        const updateLocalBypassCidrsVisibility = () => {
-            if (!authModeSelect || !localBypassCidrsContainer) return;
-            localBypassCidrsContainer.style.display = authModeSelect.value === 'local_bypass' ? '' : 'none';
+        const proxyAuthRequirements = container.querySelector('#proxy_auth_requirements');
+        const updateAuthModeVisibility = () => {
+            if (!authModeSelect) return;
+            if (localBypassCidrsContainer) {
+                localBypassCidrsContainer.style.display = authModeSelect.value === 'local_bypass' ? '' : 'none';
+            }
+            if (proxyAuthRequirements) {
+                proxyAuthRequirements.style.display = authModeSelect.value === 'no_login' ? '' : 'none';
+            }
         };
         if (authModeSelect) {
-            authModeSelect.addEventListener('change', updateLocalBypassCidrsVisibility);
-            updateLocalBypassCidrsVisibility();
+            authModeSelect.addEventListener('change', updateAuthModeVisibility);
+            updateAuthModeVisibility();
         }
         
         // Load stateful management info
@@ -1698,6 +1832,10 @@ const SettingsForms = {
         if (form && !form.hasAttribute('data-app-type')) {
             form.setAttribute('data-app-type', appType);
         }
+
+        container.querySelectorAll('.instance-item').forEach((instanceItem) => {
+            SettingsForms.bindInstanceNameHeading(instanceItem);
+        });
         
         // Add listeners for test connection buttons
         const testButtons = container.querySelectorAll('.test-connection-btn');
@@ -1861,11 +1999,12 @@ const SettingsForms = {
                 const newInstanceDiv = document.createElement('div');
                 newInstanceDiv.className = 'instance-item'; // Use instance-item
                 newInstanceDiv.dataset.instanceId = currentCount;
+                const newInstanceName = `Instance ${currentCount + 1}`;
                 
                 // Set content for the new instance using the updated structure
                 newInstanceDiv.innerHTML = `
                     <div class="instance-header">
-                        <h4>Instance ${currentCount + 1}: Instance ${currentCount + 1}</h4>
+                        ${SettingsForms.generateInstanceIdentity(currentCount, newInstanceName)}
                         <div class="instance-actions">
                              <button type="button" class="remove-instance-btn">Remove</button>
                              <button type="button" class="test-connection-btn" data-instance="${currentCount}" style="margin-left: 10px;">
@@ -1875,24 +2014,24 @@ const SettingsForms = {
                     </div>
                     <div class="instance-content">
                         <div class="setting-item">
-                            <label for="${appType}-name-${currentCount}">Name:</label>
-                            <input type="text" id="${appType}-name-${currentCount}" name="name" value="Instance ${currentCount + 1}" placeholder="Friendly name for this instance">
-                            <p class="setting-help">Friendly name for this ${appType} instance</p>
+                            <label for="${appType}-name-${currentCount}"><span class="info-icon" title="A friendly label to identify this instance in the UI"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Name:</label>
+                            <input type="text" id="${appType}-name-${currentCount}" name="name" value="${SettingsForms.escapeHtml(newInstanceName)}" placeholder="Friendly name for this instance">
+                            <p class="setting-help">Friendly name for this ${appType} instance. “Default” is reserved for the disabled placeholder.</p>
                         </div>
                         <div class="setting-item">
-                            <label for="${appType}-url-${currentCount}">URL:</label>
+                            <label for="${appType}-url-${currentCount}"><span class="info-icon" title="The base URL of your ${appType} instance"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;URL:</label>
                             <input type="text" id="${appType}-url-${currentCount}" name="api_url" value="" placeholder="Base URL (e.g., http://localhost:8989)">
                              <p class="setting-help">Base URL for ${appType} (e.g., http://localhost:8989)</p>
                         </div>
                         <div class="setting-item">
-                            <label for="${appType}-key-${currentCount}">API Key:</label>
+                            <label for="${appType}-key-${currentCount}"><span class="info-icon" title="Found in your app's settings under General or Security"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;API Key:</label>
                             <input type="text" id="${appType}-key-${currentCount}" name="api_key" value="" placeholder="API key">
                              <p class="setting-help">API key for ${appType}</p>
                         </div>
                         <div class="setting-item">
-                            <label for="${appType}-enabled-${currentCount}">Enabled:</label>
+                            <label for="${appType}-enabled-${currentCount}"><span class="info-icon" title="Toggle this instance on or off without removing it"><i class="fas fa-info-circle"></i></span>&nbsp;&nbsp;&nbsp;Enabled:</label>
                             <label class="toggle-switch">
-                                <input type="checkbox" id="${appType}-enabled-${currentCount}" name="enabled" checked>
+                                <input type="checkbox" id="${appType}-enabled-${currentCount}" name="enabled">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -1901,6 +2040,7 @@ const SettingsForms = {
                 
                 // Add the new instance to the container
                 instancesContainer.appendChild(newInstanceDiv);
+                SettingsForms.bindInstanceNameHeading(newInstanceDiv);
                 
                 // Update the button text with new count
                 updateAddButtonText();
@@ -2130,11 +2270,6 @@ styleEl.innerHTML = `
     }
     .toggle-switch input:checked + .toggle-slider:before {
         transform: translateX(20px);
-    }
-    
-    /* Align setting help text 3 characters to the left */
-    .setting-help {
-        margin-left: -3ch !important;
     }
 `;
 document.head.appendChild(styleEl);

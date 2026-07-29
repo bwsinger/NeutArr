@@ -45,8 +45,10 @@ from src.primary.utils.logger import (
     update_logging_levels,
 )  # Import get_logger, LOG_DIR, and update_logging_levels
 from src.primary.utils.version import get_runtime_version
+from src.primary.log_redaction import redact_sensitive_data
 from src.primary.auth import (
     INSTANCE_STORAGE_KEY,
+    INVALID_LOCAL_BYPASS_CIDRS_ERROR,
     authenticate_request,
     normalize_local_bypass_cidrs,
     reset_bypass_caches,
@@ -68,8 +70,11 @@ from src.primary.routes.history_routes import history_blueprint
 # Import scheduler blueprint
 from src.primary.routes.scheduler_routes import scheduler_api
 
-# Import background module to trigger manual cycle resets
-from src.primary import background
+# Keep the web routes attached to the same package instance as the runtime
+# worker import. NeutArr can be loaded as either ``primary`` (main.py) or
+# ``src.primary`` (tests/tooling), so an absolute import can create a second
+# background module with an empty cycle registry.
+from . import background
 
 # Disable Flask default logging
 log = logging.getLogger("werkzeug")
@@ -358,14 +363,14 @@ def logs_stream():
                                         stripped = line.strip()
                                         if stripped:
                                             prefix = f"[{name.upper()}] " if app_type == "all" else ""
-                                            yield f"data: {prefix}{stripped}\n\n"
+                                            yield f"data: {prefix}{redact_sensitive_data(stripped)}\n\n"
 
                         except FileNotFoundError:
                             web_logger.warning(f"Log file {path} disappeared during read.")
                             positions[name] = -1
                         except Exception as e:
                             web_logger.error(f"Error reading {path}: {e}")
-                            yield f"data: ERROR: Problem reading log: {str(e)}\n\n"
+                            yield f"data: ERROR: Problem reading log: {redact_sensitive_data(e)}\n\n"
 
                     except Exception as e:
                         web_logger.error(f"Error processing {name}: {e}")
@@ -390,7 +395,7 @@ def logs_stream():
             )
             try:
                 # Ensure error message is properly formatted for SSE
-                yield f"event: error\ndata: ERROR: Log streaming failed unexpectedly: {str(e)}\n\n"
+                yield (f"event: error\ndata: ERROR: Log streaming failed unexpectedly: {redact_sensitive_data(e)}\n\n")
             except Exception as yield_err:
                 web_logger.error(f"Error yielding final error message to client {client_id}: {yield_err}")
         finally:
@@ -407,7 +412,7 @@ def logs_stream():
 
     # Return the SSE response with appropriate headers for better streaming
     response = Response(stream_with_context(generate()), mimetype="text/event-stream")  # Use stream_with_context
-    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Cache-Control"] = "no-store"
     response.headers["X-Accel-Buffering"] = "no"  # Disable nginx buffering if using nginx
     return response
 
@@ -429,7 +434,9 @@ def save_general_settings():
     if not request.is_json:
         return jsonify({"success": False, "error": "Expected JSON data"}), 400
 
-    data = request.json
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Settings must be a JSON object"}), 400
 
     # Ensure auth_mode and bypass flags are consistent
     auth_mode = data.get("auth_mode")
@@ -448,8 +455,9 @@ def save_general_settings():
 
     try:
         data["local_bypass_cidrs"] = normalize_local_bypass_cidrs(data.get("local_bypass_cidrs"))
-    except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 400
+    except ValueError:
+        general_logger.warning("Rejected invalid local bypass CIDR configuration")
+        return jsonify({"success": False, "error": INVALID_LOCAL_BYPASS_CIDRS_ERROR}), 400
 
     # Save general settings
     success = settings_manager.save_settings("general", data)
@@ -495,7 +503,14 @@ def handle_app_settings(app_name):
         if not request.is_json:
             return jsonify({"success": False, "error": "Expected JSON data"}), 400
 
-        data = request.json
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"success": False, "error": "Settings must be a JSON object"}), 400
+
+        validation_error = settings_manager.validate_instance_names(app_name, data)
+        if validation_error:
+            return jsonify({"success": False, "error": validation_error}), 400
+
         web_logger.debug(f"Received {app_name} settings save request: {data}")
 
         # Clean URLs in the data before saving
@@ -886,6 +901,7 @@ def reset_app_cycle(app_name):
         with open(reset_file, "w") as f:
             f.write(str(int(time.time())))  # Write current timestamp
 
+        background.mark_cycle_reset_requested(app_name)
         web_logger.info(f"Created reset file for {app_name} at {reset_file}")
         success = True
     except Exception as e:
@@ -900,6 +916,12 @@ def reset_app_cycle(app_name):
         return jsonify(
             {"success": False, "error": f"Failed to reset cycle for {app_name}. The app may not be running."}
         ), 500
+
+
+@app.route("/api/cycles", methods=["GET"])
+def api_cycle_status():
+    """Return live state and next-run deadlines for background app cycles."""
+    return jsonify(background.get_cycle_status_snapshot())
 
 
 # Native health endpoint (with legacy /ping alias)

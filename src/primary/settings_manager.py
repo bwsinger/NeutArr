@@ -10,13 +10,20 @@ import logging
 import os
 import pathlib
 import shutil
+import stat
 import subprocess  # nosec B404
+import tempfile
+import threading
 import time
 import time as time_module
-from typing import Any, Dict, List, Optional
+from copy import deepcopy
+from typing import Any, Callable, Dict, List, Optional
+
+from src.primary.log_redaction import install_sensitive_data_filter, redact_sensitive_data
 
 # Create a simple logger for settings_manager
 logging.basicConfig(level=logging.INFO)
+install_sensitive_data_filter()
 settings_logger = logging.getLogger("settings_manager")
 
 # Settings directory setup - Root config directory can be overridden by environment variable, defaulting to /config
@@ -32,10 +39,56 @@ KNOWN_SETTINGS_FILES = {app_name: SETTINGS_DIR / f"{app_name}.json" for app_name
 KNOWN_DEFAULT_CONFIG_FILES = {
     app_name: pathlib.Path(DEFAULT_CONFIGS_DIR) / f"{app_name}.json" for app_name in KNOWN_APP_TYPES
 }
+INSTANCE_APP_TYPES = frozenset({"sonarr", "radarr", "lidarr", "readarr", "whisparr", "eros"})
+RESERVED_INSTANCE_NAME = "default"
 
 # Add a settings cache with timestamps to avoid excessive disk reads
 settings_cache = {}  # Format: {app_name: {'timestamp': timestamp, 'data': settings_dict}}
 CACHE_TTL = 5  # Cache time-to-live in seconds
+_settings_write_lock = threading.RLock()
+
+
+def _atomic_write_json(file_path: pathlib.Path, data: Dict[str, Any]) -> None:
+    """Durably replace a JSON file without exposing a partial write."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode = stat.S_IMODE(file_path.stat().st_mode) if file_path.exists() else 0o600
+    file_descriptor = None
+    temp_path = None
+
+    try:
+        file_descriptor, temp_name = tempfile.mkstemp(
+            dir=file_path.parent,
+            prefix=f".{file_path.name}.",
+            suffix=".tmp",
+        )
+        temp_path = pathlib.Path(temp_name)
+        os.fchmod(file_descriptor, existing_mode)
+
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temp_file:
+            file_descriptor = None
+            json.dump(data, temp_file, indent=2)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(temp_path, file_path)
+        temp_path = None
+
+        # Persist the directory entry where the filesystem supports it. Some
+        # network filesystems reject directory fsync even though replace works.
+        try:
+            directory_descriptor = os.open(file_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as error:
+            settings_logger.debug(f"Unable to fsync settings directory {file_path.parent}: {error}")
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _validate_app_type(app_name: str) -> bool:
@@ -46,16 +99,84 @@ def _validate_app_type(app_name: str) -> bool:
     return False
 
 
+def _normalize_instance_enabled_defaults(app_name: str, settings: Dict[str, Any]) -> bool:
+    """Make instance enablement explicit without disabling configured legacy instances."""
+    if app_name not in INSTANCE_APP_TYPES:
+        return False
+
+    instances = settings.get("instances")
+    if not isinstance(instances, list):
+        return False
+
+    updated = False
+    for instance in instances:
+        if not isinstance(instance, dict):
+            continue
+
+        api_url = str(instance.get("api_url") or "").strip()
+        api_key = str(instance.get("api_key") or "").strip()
+        has_complete_connection = bool(api_url and api_key)
+        instance_name_parts = str(instance.get("name") or "").strip().casefold().split()
+        is_generated_placeholder = instance_name_parts == ["default"] or (
+            len(instance_name_parts) == 2 and instance_name_parts[0] == "instance" and instance_name_parts[1].isdigit()
+        )
+
+        if "enabled" not in instance:
+            # Preserve the previous behavior for configured legacy instances,
+            # while incomplete placeholders now fail closed.
+            instance["enabled"] = has_complete_connection
+            updated = True
+        elif instance.get("enabled") is True and is_generated_placeholder and not api_url and not api_key:
+            # Migrate untouched placeholders created by older defaults.
+            instance["enabled"] = False
+            updated = True
+
+    return updated
+
+
+def validate_instance_names(app_name: str, settings: Dict[str, Any]) -> Optional[str]:
+    """Return a user-facing error when an app uses a reserved instance name."""
+    if app_name not in INSTANCE_APP_TYPES:
+        return None
+
+    instances = settings.get("instances")
+    if not isinstance(instances, list):
+        return None
+
+    for index, instance in enumerate(instances):
+        if not isinstance(instance, dict):
+            continue
+
+        normalized_name = " ".join(str(instance.get("name") or "").split()).casefold()
+        if normalized_name != RESERVED_INSTANCE_NAME:
+            continue
+
+        is_empty_disabled_placeholder = (
+            index == 0
+            and not bool(instance.get("enabled", False))
+            and not str(instance.get("api_url") or "").strip()
+            and not str(instance.get("api_key") or "").strip()
+        )
+        if not is_empty_disabled_placeholder:
+            return (
+                'The instance name "Default" is reserved for the disabled placeholder. '
+                "Choose a descriptive name before configuring or enabling this instance."
+            )
+
+    return None
+
+
 def clear_cache(app_name=None):
     """Clear the settings cache for a specific app or all apps."""
     global settings_cache
-    if app_name:
-        if app_name in settings_cache:
-            settings_logger.debug(f"Clearing cache for {app_name}")
-            settings_cache.pop(app_name, None)
-    else:
-        settings_logger.debug("Clearing entire settings cache")
-        settings_cache = {}
+    with _settings_write_lock:
+        if app_name:
+            if app_name in settings_cache:
+                settings_logger.debug(f"Clearing cache for {app_name}")
+                settings_cache.pop(app_name, None)
+        else:
+            settings_logger.debug("Clearing entire settings cache")
+            settings_cache = {}
 
 
 def get_settings_file_path(app_name: str) -> pathlib.Path:
@@ -160,6 +281,9 @@ def load_settings(app_type, use_cache=True):
                     current_settings[key] = value
                     updated = True
 
+            if _normalize_instance_enabled_defaults(app_type, current_settings):
+                updated = True
+
             # If keys were added, save the updated file
             if updated:
                 settings_logger.info(f"Added missing default keys to {app_type}.json")
@@ -191,22 +315,60 @@ def save_settings(app_name: str, settings_data: Dict[str, Any]) -> bool:
         settings_logger.error(f"Attempted to save settings for unknown app type: {app_name}")
         return False
 
+    if not isinstance(settings_data, dict):
+        settings_logger.error(f"Refused to save non-object settings for {app_name}")
+        return False
+
+    validation_error = validate_instance_names(app_name, settings_data)
+    if validation_error:
+        settings_logger.warning(f"Refused invalid instance name configuration for {app_name}")
+        return False
+
     settings_file = get_settings_file_path(app_name)
     try:
-        # Ensure the directory exists (though it should from the top-level check)
-        settings_file.parent.mkdir(parents=True, exist_ok=True)
+        with _settings_write_lock:
+            _atomic_write_json(settings_file, settings_data)
+            settings_logger.info(f"Settings saved successfully for {app_name} to {settings_file}")
 
-        # Write the provided settings data directly
-        with open(settings_file, "w") as f:
-            json.dump(settings_data, f, indent=2)
-        settings_logger.info(f"Settings saved successfully for {app_name} to {settings_file}")
+            # Clear cache for this app to ensure fresh reads
+            clear_cache(app_name)
 
-        # Clear cache for this app to ensure fresh reads
-        clear_cache(app_name)
-
-        return True
+            return True
     except Exception as e:
         settings_logger.error(f"Error saving settings for {app_name} to {settings_file}: {e}")
+        return False
+
+
+def update_settings(app_name: str, update_callback: Callable[[Dict[str, Any]], None]) -> bool:
+    """Atomically apply an in-process read/modify/write settings update."""
+    if not _validate_app_type(app_name):
+        settings_logger.error(f"Attempted to update settings for unknown app type: {app_name}")
+        return False
+
+    if not callable(update_callback):
+        settings_logger.error(f"Refused non-callable settings update for {app_name}")
+        return False
+
+    settings_file = get_settings_file_path(app_name)
+    try:
+        with _settings_write_lock:
+            current_settings = load_settings(app_name, use_cache=False)
+            if not isinstance(current_settings, dict):
+                settings_logger.error(f"Refused to update non-object settings for {app_name}")
+                return False
+
+            updated_settings = deepcopy(current_settings)
+            update_callback(updated_settings)
+            validation_error = validate_instance_names(app_name, updated_settings)
+            if validation_error:
+                settings_logger.warning(f"Refused invalid instance name update for {app_name}")
+                return False
+            _atomic_write_json(settings_file, updated_settings)
+            settings_logger.info(f"Settings updated successfully for {app_name} at {settings_file}")
+            clear_cache(app_name)
+            return True
+    except Exception as e:
+        settings_logger.error(f"Error updating settings for {app_name} at {settings_file}: {e}")
         return False
 
 
@@ -247,7 +409,7 @@ def get_configured_apps() -> List[str]:
         # First check if there are valid instances configured (multi-instance mode)
         if "instances" in settings and isinstance(settings["instances"], list) and settings["instances"]:
             for instance in settings["instances"]:
-                if instance.get("enabled", True) and instance.get("api_url") and instance.get("api_key"):
+                if instance.get("enabled", False) and instance.get("api_url") and instance.get("api_key"):
                     configured.append(app_name)
                     break  # One valid instance is enough to consider the app configured
             continue  # Skip the single-instance check if we already checked instances
@@ -263,9 +425,9 @@ def get_configured_apps() -> List[str]:
 def apply_timezone(timezone: str) -> bool:
     """Apply the specified timezone for the current process.
 
-    Updating /etc/localtime is best-effort because many containers run with a
-    read-only or non-root-owned /etc. NeutArr should still honor TZ when Python
-    can apply it with time.tzset().
+    The Docker entrypoint updates the container's system timezone before
+    dropping privileges. At runtime NeutArr only needs to update TZ and notify
+    the Python process through time.tzset().
     """
     requested_timezone = timezone or "UTC"
     zoneinfo_path = f"/usr/share/zoneinfo/{requested_timezone}"
@@ -283,20 +445,6 @@ def apply_timezone(timezone: str) -> bool:
     except Exception as e:
         settings_logger.error(f"Error applying process timezone {resolved_timezone}: {str(e)}")
         return False
-
-    try:
-        if os.path.lexists("/etc/localtime"):
-            os.remove("/etc/localtime")
-        os.symlink(zoneinfo_path, "/etc/localtime")
-
-        with open("/etc/timezone", "w") as f:
-            f.write(f"{resolved_timezone}\n")
-    except PermissionError as e:
-        settings_logger.warning(
-            f"Timezone applied via TZ={resolved_timezone}; skipping /etc timezone update due to permissions: {e}"
-        )
-    except OSError as e:
-        settings_logger.warning(f"Timezone applied via TZ={resolved_timezone}; skipping /etc timezone update: {e}")
 
     settings_logger.info(f"Timezone set to {resolved_timezone}")
     return True
@@ -359,7 +507,7 @@ if __name__ == "__main__":
 
     # Test loading Sonarr settings
     sonarr_settings = load_settings("sonarr")
-    settings_logger.info(f"Loaded Sonarr settings: {json.dumps(sonarr_settings, indent=2)}")
+    settings_logger.info(f"Loaded Sonarr settings: {redact_sensitive_data(json.dumps(sonarr_settings, indent=2))}")
 
     # Test getting a specific setting
     sonarr_sleep = get_setting("sonarr", "sleep_duration", 999)
@@ -370,11 +518,14 @@ if __name__ == "__main__":
         sonarr_settings["sleep_duration"] = 850
         save_settings("sonarr", sonarr_settings)
         reloaded_sonarr_settings = load_settings("sonarr")
-        settings_logger.info(f"Reloaded Sonarr settings after save: {json.dumps(reloaded_sonarr_settings, indent=2)}")
+        settings_logger.info(
+            f"Reloaded Sonarr settings after save: "
+            f"{redact_sensitive_data(json.dumps(reloaded_sonarr_settings, indent=2))}"
+        )
 
     # Test getting all settings
     all_app_settings = get_all_settings()
-    settings_logger.info(f"All loaded settings: {json.dumps(all_app_settings, indent=2)}")
+    settings_logger.info(f"All loaded settings: {redact_sensitive_data(json.dumps(all_app_settings, indent=2))}")
 
     # Test getting configured apps
     configured_list = get_configured_apps()

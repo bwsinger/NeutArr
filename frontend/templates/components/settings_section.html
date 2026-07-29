@@ -1,10 +1,14 @@
 <section id="settingsSection" class="content-section">
     <div class="section-header">
-        <h2>Settings</h2>
+        <div class="section-heading">
+            <span class="section-kicker">NeutArr</span>
+            <h2>Settings</h2>
+            <p>Manage application behavior, security, account access, and runtime preferences.</p>
+        </div>
         
         <div class="settings-actions">
             <button id="saveSettingsButton" class="save-button" disabled>
-                <i class="fas fa-save"></i> Save
+                <i class="fas fa-save" aria-hidden="true"></i> Save changes
             </button>
         </div>
     </div>
@@ -16,6 +20,18 @@
             <h3>Account & API</h3>
             <p class="settings-account-intro">Authentication mode stays in Security above. Username, password, and API key management live here.</p>
 
+            <div id="accountSettingsLocalBypassNotice" class="settings-account-bypass-notice" hidden>
+                <i class="fas fa-shield-alt" aria-hidden="true"></i>
+                <div>
+                    <strong>Account controls require authentication</strong>
+                    <p>
+                        This connection is using Local Bypass Mode. Connect from outside the bypass ranges
+                        and sign in to manage the username, password, or API key.
+                    </p>
+                </div>
+            </div>
+
+            <div id="accountSettingsControls">
             <div class="settings-account-subsection">
                 <h4><i class="fas fa-user-edit"></i> Change Username</h4>
                 <div class="setting-item">
@@ -31,7 +47,9 @@
                     <input type="password" id="currentPasswordForUsernameChange" class="form-control">
                 </div>
                 <div class="settings-account-actions">
-                    <button id="saveUsername" class="action-button primary-button">Save Username</button>
+                    <div class="settings-account-action-buttons">
+                        <button id="saveUsername" class="action-button primary-button">Save Username</button>
+                    </div>
                 </div>
                 <div id="usernameStatus" class="status-message" style="display: none;"></div>
             </div>
@@ -51,7 +69,9 @@
                     <input type="password" id="confirmPassword" class="form-control">
                 </div>
                 <div class="settings-account-actions">
-                    <button id="savePassword" class="action-button primary-button">Save Password</button>
+                    <div class="settings-account-action-buttons">
+                        <button id="savePassword" class="action-button primary-button">Save Password</button>
+                    </div>
                 </div>
                 <div id="passwordStatus" class="status-message" style="display: none;"></div>
             </div>
@@ -62,21 +82,33 @@
                     <label for="apiKeyDisplay">API Key:</label>
                     <div class="settings-account-inline-controls">
                         <input type="password" id="apiKeyDisplay" class="form-control" readonly placeholder="Loading...">
-                        <button id="toggleApiKey" class="action-button secondary-button">
-                            <i class="fas fa-eye"></i> Show
+                        <button
+                            type="button"
+                            id="toggleApiKey"
+                            class="action-button secondary-button api-key-visibility-button"
+                            aria-controls="apiKeyDisplay"
+                            aria-pressed="false"
+                            aria-label="Show API key"
+                            title="Show API key"
+                        >
+                            <i class="fas fa-eye" aria-hidden="true"></i>
+                            <span class="api-key-visibility-label">Show</span>
                         </button>
                     </div>
-                    <p class="setting-help settings-account-help">Send as <code>X-Api-Key</code> header or <code>?apikey=</code> query param.</p>
+                    <p class="setting-help settings-account-help">Send only as an <code>X-Api-Key</code> request header. URL query parameters are rejected to prevent credential leakage.</p>
                 </div>
                 <div class="settings-account-actions">
-                    <button id="copyApiKey" class="action-button secondary-button">
-                        <i class="fas fa-copy"></i> Copy
-                    </button>
-                    <button id="rotateApiKey" class="action-button danger-button">
-                        <i class="fas fa-sync-alt"></i> Rotate Key
-                    </button>
+                    <div class="settings-account-action-buttons">
+                        <button id="copyApiKey" class="action-button secondary-button">
+                            <i class="fas fa-copy"></i> Copy
+                        </button>
+                        <button id="rotateApiKey" class="action-button danger-button">
+                            <i class="fas fa-sync-alt"></i> Rotate Key
+                        </button>
+                    </div>
                 </div>
                 <div id="apiKeyStatus" class="status-message" style="display: none;"></div>
+            </div>
             </div>
         </div>
     </div>
@@ -99,6 +131,9 @@
         gap: 6px;
         border: none;
         transition: all 0.2s ease;
+        flex: 0 0 auto;
+        width: auto;
+        max-width: 100%;
     }
 
     #accountSettingsPanel .primary-button {
@@ -120,6 +155,32 @@
         margin: -4px 0 20px;
         color: var(--text-muted);
         font-size: 13px;
+    }
+
+    .settings-account-bypass-notice {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        padding: 16px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+
+    .settings-account-bypass-notice[hidden] {
+        display: none;
+    }
+
+    .settings-account-bypass-notice > i {
+        margin-top: 2px;
+        color: var(--accent-color);
+    }
+
+    .settings-account-bypass-notice p {
+        margin: 5px 0 0;
+        color: var(--text-muted);
+        line-height: 1.5;
     }
 
     .settings-account-subsection + .settings-account-subsection {
@@ -146,10 +207,13 @@
         display: flex;
         gap: 8px;
         align-items: center;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
+        width: min(100%, 620px);
     }
 
     .settings-account-inline-controls .form-control {
+        min-width: 0;
+        flex: 1 1 auto;
         font-family: monospace;
     }
 
@@ -177,10 +241,18 @@
     }
 
     .settings-account-actions {
-        margin: -4px 0 0 215px;
+        display: grid;
+        grid-template-columns: minmax(180px, 0.55fr) minmax(240px, 1fr);
+        column-gap: 24px;
+        margin: 10px 0 0;
+    }
+
+    .settings-account-action-buttons {
+        grid-column: 2;
         display: flex;
         gap: 8px;
         flex-wrap: wrap;
+        width: min(100%, 620px);
     }
 
     #accountSettingsPanel .status-message {
@@ -233,8 +305,14 @@
         }
 
         .settings-account-actions {
+            grid-template-columns: 1fr;
             margin-left: 0;
+        }
+
+        .settings-account-action-buttons {
+            grid-column: 1;
             flex-direction: column;
+            width: 100%;
         }
 
         #accountSettingsPanel .action-button {

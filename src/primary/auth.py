@@ -4,12 +4,12 @@ Authentication module for NeutArr.
 
 JWT dual-token auth (access 60min / refresh 30 days) backed by bcrypt password
 hashing. Config persisted in /config/users.json. Supports two bypass modes:
-  - proxy_auth_bypass: disable all auth when behind an SSO reverse proxy
-  - local_access_bypass: LAN IPs skip auth (proper ipaddress CIDR validation)
+  - proxy_auth_bypass: trust authenticated identity headers from configured proxies
+  - local_access_bypass: configured client CIDRs skip auth
 
 API key auth: an auto-generated key stored in users.json is always a valid
-credential via X-Api-Key header or ?apikey= query param, independent of
-login/bypass mode. Useful for scripts and external tool integrations.
+credential via the X-Api-Key header, independent of login/bypass mode.
+Useful for scripts and external tool integrations.
 """
 
 import json
@@ -19,6 +19,9 @@ import os
 import secrets
 import time
 import hashlib
+import hmac
+import re
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -34,12 +37,20 @@ logger = logging.getLogger("neutarr.auth")
 # ---------------------------------------------------------------------------
 
 USERS_FILE = Path(os.environ.get("NEUTARR_CONFIG_DIR", "/config")) / "users.json"
+SETUP_TOKEN_FILE = Path(os.environ.get("NEUTARR_CONFIG_DIR", "/config")) / ".setup-token"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 JWT_ALGORITHM = "HS256"
+MIN_SETUP_TOKEN_LENGTH = 16
+PROXY_AUTH_HEADER_ENV = "NEUTARR_PROXY_AUTH_HEADER"
+TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
+INVALID_LOCAL_BYPASS_CIDRS_ERROR = "Local bypass CIDRs must contain valid IPv4 or IPv6 CIDR ranges"
+_HTTP_HEADER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 
 LEGACY_ACCESS_COOKIE = "neutarr_token"
 LEGACY_REFRESH_COOKIE = "neutarr_refresh"
+REFRESH_COOKIE_PATH = "/api/auth"
+LEGACY_REFRESH_COOKIE_PATH = "/api/auth/refresh"
 
 
 def get_instance_storage_key() -> str:
@@ -55,8 +66,8 @@ def get_instance_storage_key() -> str:
 
 
 INSTANCE_STORAGE_KEY = get_instance_storage_key()
-ACCESS_COOKIE = f"neutarr_token_{INSTANCE_STORAGE_KEY}"  # non-httponly; JS-readable for AJAX
-REFRESH_COOKIE = f"neutarr_refresh_{INSTANCE_STORAGE_KEY}"  # httponly; auto-sent to refresh endpoint
+ACCESS_COOKIE = f"neutarr_token_{INSTANCE_STORAGE_KEY}"
+REFRESH_COOKIE = f"neutarr_refresh_{INSTANCE_STORAGE_KEY}"
 
 # Private RFC-1918 + loopback CIDR ranges for local access bypass
 DEFAULT_LOCAL_BYPASS_CIDRS = [
@@ -84,7 +95,6 @@ ALWAYS_PUBLIC_PATHS = frozenset(
         "/api/auth/refresh",
         "/api/auth/status",
         "/api/auth/setup",
-        "/api/auth/skip-setup",
         "/api/auth/verify",
     }
 )
@@ -105,81 +115,111 @@ class AuthConfigManager:
 
     def __init__(self):
         self._config: Optional[dict] = None
+        self._lock = threading.RLock()
 
     def _load(self) -> None:
-        if USERS_FILE.exists():
-            try:
-                with open(USERS_FILE) as f:
-                    self._config = json.load(f)
-            except Exception as e:
-                logger.error(f"Failed to load users.json: {e}")
+        with self._lock:
+            if USERS_FILE.exists():
+                try:
+                    with open(USERS_FILE) as f:
+                        self._config = json.load(f)
+                except Exception as e:
+                    logger.error(f"Failed to load users.json: {e}")
+                    self._config = self._default_config()
+            else:
                 self._config = self._default_config()
-        else:
-            self._config = self._default_config()
-            self._save()
+                self._save()
 
     def _default_config(self) -> dict:
         return {
             "jwt_secret": secrets.token_urlsafe(32),
             "api_key": secrets.token_urlsafe(24),
             "users": [],
-            "setup_skipped": False,
         }
 
-    def _save(self) -> None:
-        USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(USERS_FILE, "w") as f:
-                json.dump(self._config, f, indent=2)
-            os.chmod(USERS_FILE, 0o600)
-        except Exception as e:
-            logger.error(f"Failed to save users.json: {e}")
+    def _save(self) -> bool:
+        """Persist auth configuration atomically with owner-only permissions."""
+        with self._lock:
+            USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = USERS_FILE.with_name(f".{USERS_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            try:
+                with open(temp_file, "w") as f:
+                    json.dump(self._config, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(temp_file, 0o600)
+                os.replace(temp_file, USERS_FILE)
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save users.json: {e}")
+                try:
+                    temp_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
 
     @property
     def config(self) -> dict:
-        if self._config is None:
-            self._load()
-        return self._config
+        with self._lock:
+            if self._config is None:
+                self._load()
+            return self._config
 
     def get_jwt_secret(self) -> str:
         return self.config.get("jwt_secret", "")
 
     def has_users(self) -> bool:
-        return len(self.config.get("users", [])) > 0
-
-    def is_setup_skipped(self) -> bool:
-        return self.config.get("setup_skipped", False)
+        with self._lock:
+            return len(self.config.get("users", [])) > 0
 
     def get_user(self, username: str) -> Optional[dict]:
-        for user in self.config.get("users", []):
-            if user.get("username") == username:
-                return user
-        return None
+        with self._lock:
+            for user in self.config.get("users", []):
+                if user.get("username") == username:
+                    return user
+            return None
 
     def create_user(self, username: str, password: str) -> bool:
-        """Create first (and only) user. Returns False if user already exists."""
-        if self.get_user(username):
-            logger.warning(f"User '{username}' already exists.")
-            return False
-        hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
-        self.config.setdefault("users", []).append(
-            {
+        """Atomically create the first user and refuse every later creation."""
+        with self._lock:
+            if self.config.get("users"):
+                logger.warning("Refused user creation because setup is already complete.")
+                return False
+
+            hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+            user = {
                 "username": username,
                 "password": hashed,
                 "disabled": False,
+                "session_version": 0,
             }
-        )
-        self._save()
-        logger.info(f"User '{username}' created.")
-        return True
+            self.config.setdefault("users", []).append(user)
+            if not self._save():
+                self.config["users"].remove(user)
+                return False
+            logger.info(f"User '{username}' created.")
+            return True
 
     def update_password(self, username: str, new_password: str) -> bool:
-        for user in self.config.get("users", []):
-            if user.get("username") == username:
-                user["password"] = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(rounds=12)).decode()
-                self._save()
+        new_password_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(rounds=12)).decode()
+        with self._lock:
+            user = self.get_user(username)
+            if not user:
+                return False
+
+            previous_password = user.get("password")
+            previous_version = user.get("session_version")
+            user["password"] = new_password_hash
+            user["session_version"] = self._get_user_session_version(user) + 1
+            if self._save():
                 return True
-        return False
+
+            user["password"] = previous_password
+            if previous_version is None:
+                user.pop("session_version", None)
+            else:
+                user["session_version"] = previous_version
+            return False
 
     def update_username(self, old_username: str, new_username: str) -> bool:
         if self.get_user(new_username):
@@ -190,10 +230,6 @@ class AuthConfigManager:
                 self._save()
                 return True
         return False
-
-    def skip_setup(self) -> None:
-        self.config["setup_skipped"] = True
-        self._save()
 
     def get_api_key(self) -> str:
         """Return stored API key, generating one if missing (migration path)."""
@@ -211,8 +247,120 @@ class AuthConfigManager:
         self._save()
         return key
 
+    @staticmethod
+    def _get_user_session_version(user: dict) -> int:
+        """Return a safe session generation for legacy or current user records."""
+        value = user.get("session_version", 0)
+        if type(value) is int and value >= 0:
+            return value
+        return 0
+
+    def get_session_version(self, username: str) -> Optional[int]:
+        """Return the current session generation for an enabled user."""
+        with self._lock:
+            user = self.get_user(username)
+            if not user or user.get("disabled", False):
+                return None
+            return self._get_user_session_version(user)
+
+    def revoke_user_sessions(self, username: str) -> bool:
+        """Invalidate every JWT session previously issued to a user."""
+        with self._lock:
+            user = self.get_user(username)
+            if not user:
+                return False
+
+            previous_version = user.get("session_version")
+            user["session_version"] = self._get_user_session_version(user) + 1
+            if self._save():
+                return True
+
+            if previous_version is None:
+                user.pop("session_version", None)
+            else:
+                user["session_version"] = previous_version
+            return False
+
 
 auth_config = AuthConfigManager()
+
+_setup_token_lock = threading.Lock()
+
+
+def _read_setup_token_file() -> Optional[str]:
+    try:
+        token = SETUP_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        return token or None
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        logger.error(f"Failed to read setup token file {SETUP_TOKEN_FILE}: {e}")
+        return None
+
+
+def ensure_setup_token() -> Optional[str]:
+    """Return the configured first-run token, generating a persistent one if needed."""
+    if auth_config.has_users():
+        try:
+            SETUP_TOKEN_FILE.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not remove stale setup token file {SETUP_TOKEN_FILE}: {e}")
+        return None
+
+    environment_token = os.environ.get("NEUTARR_SETUP_TOKEN", "").strip()
+    if environment_token:
+        if len(environment_token) < MIN_SETUP_TOKEN_LENGTH:
+            logger.error(
+                "NEUTARR_SETUP_TOKEN must contain at least "
+                f"{MIN_SETUP_TOKEN_LENGTH} characters before first-run setup can continue."
+            )
+            return None
+        return environment_token
+
+    with _setup_token_lock:
+        existing_token = _read_setup_token_file()
+        if existing_token:
+            return existing_token
+
+        token = secrets.token_urlsafe(24)
+        SETUP_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = SETUP_TOKEN_FILE.with_name(f".{SETUP_TOKEN_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                f.write(f"{token}\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temp_file, 0o600)
+            os.replace(temp_file, SETUP_TOKEN_FILE)
+        except OSError as e:
+            logger.error(f"Failed to create first-run setup token: {e}")
+            try:
+                temp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+
+        logger.warning(
+            "First-run setup token: %s (also stored at %s; it is removed after account creation)",
+            token,
+            SETUP_TOKEN_FILE,
+        )
+        return token
+
+
+def validate_setup_token(candidate: str) -> bool:
+    expected = ensure_setup_token()
+    if not expected or not candidate:
+        return False
+    return hmac.compare_digest(expected.encode("utf-8"), candidate.strip().encode("utf-8"))
+
+
+def consume_setup_token() -> None:
+    """Remove the generated setup-token file after successful account creation."""
+    try:
+        SETUP_TOKEN_FILE.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning(f"Could not remove consumed setup token file {SETUP_TOKEN_FILE}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -243,19 +391,29 @@ def validate_password_strength(password: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def create_access_token(username: str) -> str:
+def create_access_token(username: str, session_version: Optional[int] = None) -> str:
+    if session_version is None:
+        session_version = auth_config.get_session_version(username)
+    if session_version is None:
+        raise ValueError("Cannot create a token for an unknown or disabled user")
     payload = {
         "sub": username,
         "type": "access",
+        "session_version": session_version,
         "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     }
     return jwt.encode(payload, auth_config.get_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 
-def create_refresh_token(username: str) -> str:
+def create_refresh_token(username: str, session_version: Optional[int] = None) -> str:
+    if session_version is None:
+        session_version = auth_config.get_session_version(username)
+    if session_version is None:
+        raise ValueError("Cannot create a token for an unknown or disabled user")
     payload = {
         "sub": username,
         "type": "refresh",
+        "session_version": session_version,
         "exp": datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
     }
     return jwt.encode(payload, auth_config.get_jwt_secret(), algorithm=JWT_ALGORITHM)
@@ -270,9 +428,34 @@ def decode_token(token: str) -> Optional[dict]:
         return None
 
 
-def create_token_pair(username: str) -> tuple:
+def create_token_pair(username: str) -> tuple[str, str]:
     """Return (access_token, refresh_token)."""
-    return create_access_token(username), create_refresh_token(username)
+    session_version = auth_config.get_session_version(username)
+    if session_version is None:
+        raise ValueError("Cannot create tokens for an unknown or disabled user")
+    return (
+        create_access_token(username, session_version),
+        create_refresh_token(username, session_version),
+    )
+
+
+def get_valid_token_username(payload: Optional[dict], expected_type: Optional[str] = None) -> Optional[str]:
+    """Return the enabled user for a JWT whose session generation is current."""
+    if not payload or (expected_type and payload.get("type") != expected_type):
+        return None
+
+    username = payload.get("sub")
+    if not isinstance(username, str) or not username:
+        return None
+
+    token_version = payload.get("session_version", 0)
+    if type(token_version) is not int or token_version < 0:
+        return None
+
+    current_version = auth_config.get_session_version(username)
+    if current_version is None or token_version != current_version:
+        return None
+    return username
 
 
 # ---------------------------------------------------------------------------
@@ -281,30 +464,64 @@ def create_token_pair(username: str) -> tuple:
 
 
 def set_auth_cookies(response, access_token: str, refresh_token: str) -> None:
-    """Set access (non-httponly) and refresh (httponly) cookies on response."""
+    """Set browser session cookies without exposing JWTs to JavaScript."""
+    secure = _use_secure_cookies()
     response.set_cookie(
         ACCESS_COOKIE,
         access_token,
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        httponly=False,  # JS-readable so frontend can add Authorization headers
-        samesite="Lax",
+        httponly=True,
+        secure=secure,
+        samesite="Strict",
         path="/",
     )
     response.set_cookie(
         REFRESH_COOKIE,
         refresh_token,
         max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
-        httponly=True,  # Not readable by JS — only auto-sent to refresh endpoint
-        samesite="Lax",
-        path="/api/auth/refresh",
+        httponly=True,
+        secure=secure,
+        samesite="Strict",
+        path=REFRESH_COOKIE_PATH,
     )
+    _delete_auth_cookie(response, LEGACY_ACCESS_COOKIE, "/")
+    _delete_auth_cookie(response, REFRESH_COOKIE, LEGACY_REFRESH_COOKIE_PATH)
+    _delete_auth_cookie(response, LEGACY_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE_PATH)
+
+
+def _use_secure_cookies() -> bool:
+    """Determine whether session cookies should carry the Secure attribute."""
+    configured = os.environ.get("NEUTARR_SECURE_COOKIES", "").strip().casefold()
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    if configured in {"0", "false", "no", "off"}:
+        return False
+
+    if request.is_secure:
+        return True
+    if _is_trusted_proxy_source():
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().casefold()
+        return forwarded_proto == "https"
+    return False
 
 
 def clear_auth_cookies(response) -> None:
-    response.delete_cookie(ACCESS_COOKIE, path="/")
-    response.delete_cookie(REFRESH_COOKIE, path="/api/auth/refresh")
-    response.delete_cookie(LEGACY_ACCESS_COOKIE, path="/")
-    response.delete_cookie(LEGACY_REFRESH_COOKIE, path="/api/auth/refresh")
+    _delete_auth_cookie(response, ACCESS_COOKIE, "/")
+    _delete_auth_cookie(response, REFRESH_COOKIE, REFRESH_COOKIE_PATH)
+    _delete_auth_cookie(response, REFRESH_COOKIE, LEGACY_REFRESH_COOKIE_PATH)
+    _delete_auth_cookie(response, LEGACY_ACCESS_COOKIE, "/")
+    _delete_auth_cookie(response, LEGACY_REFRESH_COOKIE, REFRESH_COOKIE_PATH)
+    _delete_auth_cookie(response, LEGACY_REFRESH_COOKIE, LEGACY_REFRESH_COOKIE_PATH)
+
+
+def _delete_auth_cookie(response, name: str, path: str) -> None:
+    response.delete_cookie(
+        name,
+        path=path,
+        httponly=True,
+        secure=_use_secure_cookies(),
+        samesite="Strict",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +538,8 @@ def get_token_from_request() -> Optional[str]:
 
 
 def get_api_key_from_request() -> Optional[str]:
-    """Extract API key from X-Api-Key header or ?apikey= query param."""
-    key = request.headers.get("X-Api-Key")
-    if key:
-        return key
-    return request.args.get("apikey")
+    """Extract an API key from the non-URL X-Api-Key credential header."""
+    return request.headers.get("X-Api-Key")
 
 
 def validate_api_key(key: str) -> bool:
@@ -342,15 +556,7 @@ def get_current_user() -> Optional[str]:
     if not token:
         return None
     payload = decode_token(token)
-    if not payload or payload.get("type") != "access":
-        return None
-    username = payload.get("sub")
-    if not username:
-        return None
-    user = auth_config.get_user(username)
-    if not user or user.get("disabled", False):
-        return None
-    return username
+    return get_valid_token_username(payload, expected_type="access")
 
 
 # ---------------------------------------------------------------------------
@@ -375,20 +581,62 @@ def _get_client_ip() -> Optional[str]:
     X-Forwarded-For is only trusted when TRUSTED_PROXIES env var is set,
     preventing spoofing when the app is directly internet-exposed.
     """
-    trusted_proxies_env = os.environ.get("TRUSTED_PROXIES", "")
-    if trusted_proxies_env:
-        trusted = [p.strip() for p in trusted_proxies_env.split(",") if p.strip()]
-        remote = request.remote_addr or ""
-        try:
-            remote_ip = ipaddress.ip_address(remote)
-            is_trusted = any(remote_ip in ipaddress.ip_network(cidr, strict=False) for cidr in trusted)
-            if is_trusted:
-                xff = request.headers.get("X-Forwarded-For", "")
-                if xff:
-                    return xff.split(",")[0].strip()
-        except ValueError:
-            pass
+    if _is_trusted_proxy_source():
+        xff = request.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()
     return request.remote_addr
+
+
+def _get_trusted_proxy_networks() -> list[ipaddress._BaseNetwork]:
+    """Return configured proxy networks, failing closed on any invalid entry."""
+    configured = os.environ.get(TRUSTED_PROXIES_ENV, "")
+    entries = [entry.strip() for entry in configured.split(",") if entry.strip()]
+    if not entries:
+        return []
+
+    try:
+        return [ipaddress.ip_network(entry, strict=False) for entry in entries]
+    except ValueError:
+        logger.warning("Invalid trusted proxy configuration; proxy trust disabled")
+        return []
+
+
+def _is_trusted_proxy_source() -> bool:
+    """Return whether the immediate TCP peer is a configured trusted proxy."""
+    try:
+        remote_ip = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return False
+    return any(remote_ip in network for network in _get_trusted_proxy_networks())
+
+
+def _get_proxy_identity() -> Optional[str]:
+    """Return a proxy-asserted identity only for a request from a trusted proxy."""
+    if not _is_trusted_proxy_source():
+        return None
+
+    header_name = os.environ.get(PROXY_AUTH_HEADER_ENV, "").strip()
+    if not header_name or not _HTTP_HEADER_NAME_PATTERN.fullmatch(header_name):
+        return None
+
+    identity = request.headers.get(header_name, "").strip()
+    if not identity or len(identity) > 512:
+        return None
+    return identity
+
+
+def _is_proxy_authenticated_request() -> bool:
+    """Return whether proxy bypass is enabled and this request is authenticated."""
+    return _get_proxy_bypass() and _get_proxy_identity() is not None
+
+
+def _is_local_bypass_request() -> bool:
+    """Return whether local bypass is enabled and the resolved client is allowed."""
+    if not _get_local_bypass():
+        return False
+    client_ip = _get_client_ip()
+    return bool(client_ip and _is_local_ip(client_ip))
 
 
 def normalize_local_bypass_cidrs(value, *, use_defaults_when_empty: bool = True) -> list[str]:
@@ -505,16 +753,27 @@ def authenticate_request():
     or a redirect/JSON response to reject it. Priority order:
       1. Always-public paths (static, /login, /setup, /api/auth/*)
       2. Valid JWT access token OR valid API key (explicit credentials always win)
-      3. No users and setup not skipped → force setup flow
-      4. API requests: always require credentials — bypass modes do not exempt
-         API calls. The only exception is no-user proxy mode (setup_skipped=True,
-         has_users=False) where no API key has been issued to anyone.
-      5. Page requests: proxy_auth_bypass OR (local_access_bypass + LAN IP)
-         removes the login redirect — the web UI is accessible without logging in.
+      3. No users → force the token-protected setup flow
+      4. Request-scoped proxy or local bypass authorization
+      5. API requests without credentials or an eligible bypass are rejected
       6. Reject: redirect /login for page requests
     """
     path = request.path
     is_api = path.startswith("/api/")
+
+    # API keys in URLs leak through browser history, referrers, proxy logs, and
+    # monitoring. Reject them explicitly instead of silently treating them as
+    # missing credentials.
+    if "apikey" in request.args:
+        response = jsonify(
+            {
+                "error": "API keys in query parameters are not supported. Use the X-Api-Key header.",
+                "code": "api_key_query_unsupported",
+            }
+        )
+        response.status_code = 400
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     # 1. Public paths
     if is_public_path(path):
@@ -527,28 +786,23 @@ def authenticate_request():
     if get_current_user():
         return None
 
-    # 3. No users and setup not skipped — force setup flow
-    if not auth_config.has_users() and not auth_config.is_setup_skipped():
+    # 3. No users — force the token-protected setup flow
+    if not auth_config.has_users():
         if is_api:
             return jsonify({"error": "Setup required", "setup_required": True}), 401
         return redirect("/setup")
 
-    # 4. API requests always require credentials (JWT or API key).
-    #    Bypass modes do not exempt API calls — they only skip the web UI login.
-    #    Exception: no-user proxy mode (setup_skipped, no users) — fully open
-    #    because there is no API key issued to anyone in this configuration.
-    if is_api:
-        if not auth_config.has_users():  # no-user proxy mode, setup_skipped=True
-            return None
-        return jsonify({"error": "Authentication required"}), 401
-
-    # 5. Page requests: bypass modes remove the login redirect
-    if _get_proxy_bypass():
+    # 4. Bypass modes authorize only requests that meet their trust boundary.
+    #    No durable credential is disclosed to the browser.
+    if _is_proxy_authenticated_request() or _is_local_bypass_request():
         return None
-    if _get_local_bypass():
-        client_ip = _get_client_ip()
-        if client_ip and _is_local_ip(client_ip):
-            return None
+
+    # 5. API requests require explicit credentials or an eligible bypass.
+    if is_api:
+        response = jsonify({"error": "Authentication required"})
+        response.status_code = 401
+        response.headers["X-NeutArr-Auth-Required"] = "1"
+        return response
 
     # 6. Reject page request — send to login
     return redirect("/login")
