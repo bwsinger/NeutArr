@@ -11,7 +11,7 @@ from src.primary.utils.logger import get_logger
 from src.primary.apps.radarr import api as radarr_api
 from src.primary.stats_manager import increment_stat
 from src.primary.stateful_manager import is_processed, add_processed_id
-from src.primary.utils.history_utils import log_processed_media
+from src.primary.utils.history_utils import build_media_details, log_processed_media
 
 # Get logger for the app
 radarr_logger = get_logger("radarr")
@@ -41,7 +41,9 @@ def _get_release_preference(release_like: Dict[str, Any], profile_info: Dict[str
     return quality_rank, _coerce_int(release_like.get("customFormatScore"), 0)
 
 
-def _release_decision_snapshot(release_like: Optional[Dict[str, Any]], profile_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _release_decision_snapshot(
+    release_like: Optional[Dict[str, Any]], profile_info: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
     if release_like is None:
         return None
 
@@ -118,9 +120,7 @@ def _select_strict_upgrade_candidate(
                 counts["same_quality_at_cutoff"] += 1
                 continue
 
-            is_valid_upgrade = (
-                candidate_custom_format_score >= current_custom_format_score + min_upgrade_format_score
-            )
+            is_valid_upgrade = candidate_custom_format_score >= current_custom_format_score + min_upgrade_format_score
         else:
             counts["lower_quality"] += 1
             continue
@@ -266,7 +266,14 @@ def process_cutoff_upgrades(
 
             # Log to history so the upgrade appears in the history UI
             media_name = f"{movie_title} ({movie_year})"
-            log_processed_media("radarr", media_name, movie_id, instance_name, "upgrade")
+            log_processed_media(
+                "radarr",
+                media_name,
+                movie_id,
+                instance_name,
+                "upgrade",
+                build_media_details("radarr", movie),
+            )
             radarr_logger.debug(f"Logged quality upgrade to history for movie ID {movie_id}")
 
             processed_count += 1

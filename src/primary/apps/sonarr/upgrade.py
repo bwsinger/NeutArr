@@ -11,7 +11,7 @@ from src.primary.utils.logger import get_logger
 from src.primary.apps.sonarr import api as sonarr_api
 from src.primary.stats_manager import increment_stat
 from src.primary.stateful_manager import is_processed, add_processed_id
-from src.primary.utils.history_utils import log_processed_media
+from src.primary.utils.history_utils import build_media_details, log_processed_media
 from src.primary.settings_manager import get_advanced_setting
 
 # Get logger for the Sonarr app
@@ -78,6 +78,23 @@ def _filter_aired_episodes(episodes: List[Dict[str, Any]], context: str) -> List
         sonarr_logger.debug(f"{context}: all {len(episodes)} episodes have aired.")
 
     return aired_episodes
+
+
+def _sonarr_search_reason(episode: Dict[str, Any]) -> str:
+    """Describe the cutoff condition Sonarr reported for a selected episode."""
+    episode_file = episode.get("episodeFile") if isinstance(episode.get("episodeFile"), dict) else {}
+    if episode.get("qualityCutoffNotMet") is True or episode_file.get("qualityCutoffNotMet") is True:
+        return "Quality is below profile cutoff"
+    return "Current file does not meet the Sonarr profile cutoff"
+
+
+def _add_sonarr_search_context(episode_details: Dict[str, Any], cutoff_record: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach NeutArr-only search context without modifying Sonarr's API object."""
+    details = dict(episode_details)
+    details["_neutarr_search_context"] = {
+        "search_reason": _sonarr_search_reason(cutoff_record),
+    }
+    return details
 
 
 def process_cutoff_upgrades(
@@ -188,6 +205,7 @@ def process_upgrade_episodes_mode(
         return False
 
     sonarr_logger.info(f"Selected {len(episodes_to_search)} cutoff unmet episodes to search for upgrades.")
+    cutoff_records_by_id = {episode.get("id"): episode for episode in episodes_to_search}
 
     # Group episodes by series for potential refresh
     series_to_process: Dict[int, List[int]] = {}
@@ -268,7 +286,20 @@ def process_upgrade_episodes_mode(
                             media_name = f"{series_title} - {season_episode} - {episode_title}"
                             # Skip logging individual episodes since we log the season pack
                             if not skip_episode_history:
-                                log_processed_media("sonarr", media_name, episode_id, instance_name, "upgrade")
+                                log_processed_media(
+                                    "sonarr",
+                                    media_name,
+                                    episode_id,
+                                    instance_name,
+                                    "upgrade",
+                                    build_media_details(
+                                        "sonarr",
+                                        _add_sonarr_search_context(
+                                            episode_details,
+                                            cutoff_records_by_id.get(episode_id, {}),
+                                        ),
+                                    ),
+                                )
                             sonarr_logger.debug(f"Logged quality upgrade to history for episode ID {episode_id}")
                     except Exception as e:
                         sonarr_logger.error(f"Failed to log history for episode ID {episode_id}: {str(e)}")
@@ -309,7 +340,23 @@ def log_season_pack_upgrade(
             media_name = f"{series_title} - {season_id} - COMPLETE SEASON PACK"
 
             # Log the season pack upgrade to history with normal 'upgrade' operation type
-            log_processed_media("sonarr", media_name, season_id_num, instance_name, "upgrade")
+            details = build_media_details(
+                "sonarr",
+                {
+                    "series": series_details,
+                    "seasonNumber": season_number,
+                },
+                "Season pack",
+            )
+            details["search_reason"] = "Season contains episodes that do not meet their Sonarr profile cutoff"
+            log_processed_media(
+                "sonarr",
+                media_name,
+                season_id_num,
+                instance_name,
+                "upgrade",
+                details,
+            )
             sonarr_logger.debug(f"Logged season pack upgrade to history for {series_title} Season {season_number}")
     except Exception as e:
         sonarr_logger.error(f"Failed to log season pack upgrade to history: {str(e)}")
@@ -598,7 +645,14 @@ def process_upgrade_seasons_mode(
                             media_name = f"{series_title} - {season_episode} - {episode_title}"
                             # Skip logging individual episodes since we log the season pack
                             if not skip_episode_history:
-                                log_processed_media("sonarr", media_name, episode_id, instance_name, "upgrade")
+                                log_processed_media(
+                                    "sonarr",
+                                    media_name,
+                                    episode_id,
+                                    instance_name,
+                                    "upgrade",
+                                    build_media_details("sonarr", episode_details),
+                                )
                             sonarr_logger.debug(f"Logged quality upgrade to history for episode ID {episode_id}")
                     except Exception as e:
                         sonarr_logger.error(f"Failed to log history for episode ID {episode_id}: {str(e)}")
@@ -696,6 +750,7 @@ def process_upgrade_shows_mode(
         all_series_episodes = _filter_aired_episodes(all_series_episodes, f"Shows-mode aired filter for {series_title}")
 
         episode_ids = [episode["id"] for episode in all_series_episodes]
+        cutoff_records_by_id = {episode.get("id"): episode for episode in all_series_episodes}
 
         if not episode_ids:
             sonarr_logger.warning(f"No valid episodes found for {series_title} after filtering")
@@ -759,7 +814,20 @@ def process_upgrade_shows_mode(
                             media_name = f"{series_title} - {season_episode} - {episode_title}"
                             # Skip logging individual episodes since we log the season pack
                             if not skip_episode_history:
-                                log_processed_media("sonarr", media_name, episode_id, instance_name, "upgrade")
+                                log_processed_media(
+                                    "sonarr",
+                                    media_name,
+                                    episode_id,
+                                    instance_name,
+                                    "upgrade",
+                                    build_media_details(
+                                        "sonarr",
+                                        _add_sonarr_search_context(
+                                            episode_details,
+                                            cutoff_records_by_id.get(episode_id, {}),
+                                        ),
+                                    ),
+                                )
                             sonarr_logger.debug(f"Logged quality upgrade to history for episode ID {episode_id}")
                     except Exception as e:
                         sonarr_logger.error(f"Failed to log history for episode ID {episode_id}: {str(e)}")
