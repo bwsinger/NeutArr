@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - dev
+      - media-server-main
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -11,6 +12,7 @@ on:
   pull_request:
     branches:
       - dev
+      - media-server-main
       - main
 
 concurrency:
@@ -70,7 +72,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install tools
-        run: pip install poetry bandit pip-audit && poetry self add poetry-plugin-export
+        run: pip install poetry==2.5.1 poetry-plugin-export==1.10.1 bandit==1.9.4 pip-audit==2.10.1
 
       - name: Bandit — Python source scan
         run: bandit -r src/ main.py -ll
