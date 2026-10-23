@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS requirements-builder
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS requirements-builder
 
 WORKDIR /app
 
@@ -20,13 +20,14 @@ RUN python -m venv /tmp/poetry-venv \
     && rm -rf /tmp/poetry-venv /tmp/requirements.txt
 
 # ─────────────────────────────────────────────
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
 
 ARG NEUTARR_VERSION
 ENV NEUTARR_VERSION=${NEUTARR_VERSION}
 
 # Runtime system deps only
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     net-tools \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
@@ -41,6 +42,8 @@ WORKDIR /app
 
 # Copy application code
 COPY . /app/
+# The lockfile includes build/dev tooling that is not installed in the runtime.
+RUN rm -f /app/poetry.lock
 COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Create non-root user and config directories
