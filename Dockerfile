@@ -1,4 +1,4 @@
-FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS requirements-builder
+FROM python:3.12-alpine@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d AS requirements-builder
 
 WORKDIR /app
 
@@ -20,17 +20,14 @@ RUN python -m venv /tmp/poetry-venv \
     && rm -rf /tmp/poetry-venv /tmp/requirements.txt
 
 # ─────────────────────────────────────────────
-FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
+FROM python:3.12-alpine@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d
 
 ARG NEUTARR_VERSION
 ENV NEUTARR_VERSION=${NEUTARR_VERSION}
 
 # Runtime system deps only
-RUN apt-get update && apt-get upgrade -y --no-install-recommends \
-    && apt-get install -y --no-install-recommends \
-    net-tools \
-    tzdata \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk upgrade --no-cache \
+    && apk add --no-cache bash shadow net-tools tzdata
 
 # Copy venv from builder
 COPY --from=requirements-builder /venv /venv
