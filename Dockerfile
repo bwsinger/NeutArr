@@ -27,7 +27,8 @@ ENV NEUTARR_VERSION=${NEUTARR_VERSION}
 
 # Runtime system deps only
 RUN apk upgrade --no-cache \
-    && apk add --no-cache bash shadow net-tools tzdata
+    && apk add --no-cache bash shadow net-tools tzdata \
+    && python -m pip uninstall -y pip
 
 # Copy venv from builder
 COPY --from=requirements-builder /venv /venv
