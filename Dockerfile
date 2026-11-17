@@ -27,7 +27,7 @@ ENV NEUTARR_VERSION=${NEUTARR_VERSION}
 
 # Runtime system deps only
 RUN apk upgrade --no-cache \
-    && apk add --no-cache bash shadow net-tools tzdata \
+    && apk add --no-cache bash shadow net-tools tzdata 'krb5-libs>=1.22.3-r0' 'zlib>=1.4-r0' \
     && python -m pip uninstall -y pip
 
 # Copy venv from builder
